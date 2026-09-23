@@ -2,1943 +2,552 @@ import os
 import re
 import json
 import base64
-import hashlib
 import logging
 import mimetypes
-import threading
+import unicodedata
 from pathlib import Path
 
 import requests
 from flask import Flask, request, jsonify, send_from_directory
 from openai import OpenAI
 
-
 app = Flask(__name__)
 
+# =========================
+# CONFIG
+# =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("superbikers")
 
-
-# =========================================================
-# VARIABLES
-# =========================================================
-
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
+GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v26.0")
 
-GRAPH_API_VERSION = os.environ.get(
-    "GRAPH_API_VERSION",
-    "v26.0"
-)
+TMP_ROOT = Path("/tmp/superbikers")
+TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-BASE_URL = os.environ.get(
-    "BASE_URL",
-    "https://superbikers-whatsapp-webhook-2.onrender.com"
-).rstrip("/")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-openai_client = (
-    OpenAI(api_key=OPENAI_API_KEY)
-    if OPENAI_API_KEY
-    else None
-)
-
-
+# sesiones en memoria
 pending_motos = {}
-seen_message_ids = set()
-state_lock = threading.Lock()
 
 
-# =========================================================
-# UTILIDADES
-# =========================================================
-
-def sender_key(sender):
-
-    return hashlib.sha256(
-        sender.encode("utf-8")
-    ).hexdigest()[:18]
-
-
-def sender_folder(sender):
-
-    return (
-        Path("/tmp/superbikers")
-        / sender_key(sender)
-    )
-
-
-def new_session():
-
-    return {
-        "photos": [],
-        "text": "",
-        "processing": False
-    }
-
-
-# =========================================================
-# HOME
-# =========================================================
-
-@app.get("/")
-def home():
-
-    return jsonify({
-        "status": "ok",
-        "service": "Superbikers WhatsApp Automatizacion"
-    }), 200
-
-
-# =========================================================
-# PRIVACIDAD
-# =========================================================
-
-@app.get("/privacy")
-def privacy():
-
-    return """
-    <html>
-
-    <head>
-
-        <title>
-            Politica de Privacidad - Superbikers Shop
-        </title>
-
-    </head>
-
-    <body style="
-        font-family:Arial;
-        max-width:800px;
-        margin:40px auto;
-        line-height:1.6;
-    ">
-
-        <h1>
-            Politica de Privacidad de Superbikers Shop
-        </h1>
-
-        <p>
-            Superbikers Shop utiliza la informacion
-            recibida mediante WhatsApp, Facebook e
-            Instagram para atender clientes,
-            administrar motocicletas y gestionar
-            publicaciones.
-        </p>
-
-        <p>
-            No vendemos ni comercializamos
-            informacion personal.
-        </p>
-
-        <p>
-            Ultima actualizacion:
-            septiembre de 2026.
-        </p>
-
-    </body>
-
-    </html>
-    """, 200
-
-
-# =========================================================
-# MOSTRAR PORTADAS
-# =========================================================
-
-@app.get("/generated/<public_id>/<filename>")
-def serve_generated(public_id, filename):
-
-    folder = (
-        Path("/tmp/superbikers")
-        / public_id
-        / "generated"
-    )
-
-    return send_from_directory(
-        folder,
-        filename
-    )
-
-
-# =========================================================
-# VERIFICAR WEBHOOK META
-# =========================================================
-
-@app.get("/webhook/whatsapp")
-def verify_webhook():
-
-    mode = request.args.get(
-        "hub.mode"
-    )
-
-    token = request.args.get(
-        "hub.verify_token"
-    )
-
-    challenge = request.args.get(
-        "hub.challenge"
-    )
-
-
-    if (
-        mode == "subscribe"
-        and
-        token == VERIFY_TOKEN
-        and
-        challenge
-    ):
-
-        logger.info(
-            "Webhook verificado correctamente por Meta"
-        )
-
-        return challenge, 200
-
-
-    return "Forbidden", 403
-
-
-# =========================================================
-# TEXTO
-# =========================================================
-
+# =========================
+# HELPERS GENERALES
+# =========================
 def normalize_text(text):
-
     if not text:
         return ""
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-    return (
-        text
-        .replace("\r\n", "\n")
-        .replace("\r", "\n")
-        .strip()
-    )
+
+def slugify(text):
+    if not text:
+        return "portada"
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_")
+    return text[:80] if text else "portada"
+
+
+def get_extension_from_mime(mime_type):
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+    return mapping.get(mime_type) or mimetypes.guess_extension(mime_type or "") or ".jpg"
 
 
 def extract_price(text):
-
     if not text:
         return ""
 
-
     patterns = [
-
         r'\$\s?\d{1,3}(?:[,\.\s]\d{3})+',
-
         r'\$\s?\d+',
-
-        r'(?i)precio\s*(?:de)?\s*\$?\s*'
-        r'(\d{1,3}(?:[,\.\s]\d{3})+|\d+)'
+        r'(?i)precio\s*(?:de)?\s*\$?\s*(\d{1,3}(?:[,\.\s]\d{3})+|\d+)'
     ]
 
-
     for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text
-        )
-
-
+        match = re.search(pattern, text)
         if match:
-
-            value = (
-                match.group(1)
-                if match.lastindex
-                else match.group(0)
-            )
-
-
-            digits = re.sub(
-                r"[^\d]",
-                "",
-                value
-            )
-
-
+            value = match.group(1) if match.lastindex else match.group(0)
+            digits = re.sub(r"[^\d]", "", value)
             if digits:
-
                 return f"${int(digits):,}"
-
 
     return ""
 
 
 def clean_cover_title(line):
-
     line = line.strip()
-
-
-    line = re.sub(
-        r'^[^\wÁÉÍÓÚÜÑáéíóúüñ]+',
-        '',
-        line
-    )
-
-
-    line = re.sub(
-        r'[^\wÁÉÍÓÚÜÑáéíóúüñ\-\+\./ ]+$',
-        '',
-        line
-    )
-
-
+    line = re.sub(r'^[^\wÁÉÍÓÚÜÑáéíóúüñ]+', '', line)
+    line = re.sub(r'[^\wÁÉÍÓÚÜÑáéíóúüñ\-\+\./ ]+$', '', line)
     return line.strip()
 
 
 def extract_cover_title(text):
-
     if not text:
         return ""
 
-
-    lines = [
-
-        line.strip()
-
-        for line in text.split("\n")
-
-        if line.strip()
-
-    ]
-
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
 
     for line in lines:
-
         if line.startswith("#"):
             continue
-
-
-        if re.fullmatch(
-            r'[\$\d\.,\s]+',
-            line
-        ):
+        if re.fullmatch(r'[\$\d\.,\s]+', line):
             continue
+        if "aceptamos" in line.lower():
+            continue
+        return clean_cover_title(line)
 
-
-        return clean_cover_title(
-            line
-        )
-
-
-    return ""
+    return "MOTO DISPONIBLE"
 
 
 def extract_hashtags(text):
-
-    return re.findall(
-        r'#\w+',
-        text or ""
-    )
+    if not text:
+        return []
+    return re.findall(r'#\w+', text)
 
 
 def extract_flags(text):
+    if not text:
+        return []
 
-    lowered = (
-        text or ""
-    ).lower()
+    text_low = text.lower()
+    found = []
 
-
-    possible = [
-
-        (
-            "preventa",
-            "Preventa"
-        ),
-
-        (
-            "nacional",
-            "Nacional"
-        ),
-
-        (
-            "nuevo ingreso",
-            "Nuevo ingreso"
-        ),
-
-        (
-            "full system",
-            "Full system"
-        ),
-
-        (
-            "placas de regalo",
-            "Placas de regalo"
-        )
-
+    posibles = [
+        "preventa",
+        "full system",
+        "nacional",
+        "nuevo ingreso",
+        "impecable",
+        "factura de importación",
+        "pedimento",
     ]
 
+    for item in posibles:
+        if item in text_low:
+            found.append(item)
 
-    return [
-
-        label
-
-        for key, label in possible
-
-        if key in lowered
-
-    ]
+    return found
 
 
-# =========================================================
-# WHATSAPP FOTO
-# =========================================================
-
-def get_extension_from_mime(mime_type):
-
-    mapping = {
-
-        "image/jpeg":
-            ".jpg",
-
-        "image/jpg":
-            ".jpg",
-
-        "image/png":
-            ".png",
-
-        "image/webp":
-            ".webp"
-
-    }
+def get_session(sender):
+    if sender not in pending_motos:
+        pending_motos[sender] = {"photos": [], "text": ""}
+    return pending_motos[sender]
 
 
-    return (
-
-        mapping.get(
-            mime_type
-        )
-
-        or
-
-        mimetypes.guess_extension(
-            mime_type or ""
-        )
-
-        or
-
-        ".jpg"
-
-    )
-
-
-def download_whatsapp_image(
-    media_id,
-    sender,
-    photo_number
-):
-
-    if not WHATSAPP_ACCESS_TOKEN:
-
-        logger.error(
-            "Falta WHATSAPP_ACCESS_TOKEN"
-        )
-
+# =========================
+# WHATSAPP CLOUD API
+# =========================
+def send_whatsapp_text(to_number, text_body):
+    if not WHATSAPP_ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        logger.error("Falta WHATSAPP_ACCESS_TOKEN o PHONE_NUMBER_ID.")
         return None
 
-
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
-
-        "Authorization":
-            f"Bearer {WHATSAPP_ACCESS_TOKEN}"
-
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
     }
-
-
-    info_url = (
-
-        f"https://graph.facebook.com/"
-        f"{GRAPH_API_VERSION}/"
-        f"{media_id}"
-
-    )
-
-
-    try:
-
-        info_response = requests.get(
-
-            info_url,
-
-            headers=headers,
-
-            timeout=30
-
-        )
-
-
-        info_response.raise_for_status()
-
-
-        media_info = (
-            info_response.json()
-        )
-
-
-        media_url = (
-            media_info.get(
-                "url"
-            )
-        )
-
-
-        mime_type = (
-            media_info.get(
-                "mime_type",
-                "image/jpeg"
-            )
-        )
-
-
-        if not media_url:
-
-            logger.error(
-                "Meta no devolvio URL"
-            )
-
-            return None
-
-
-        image_response = requests.get(
-
-            media_url,
-
-            headers=headers,
-
-            timeout=60
-
-        )
-
-
-        image_response.raise_for_status()
-
-
-    except requests.RequestException as error:
-
-        logger.exception(
-
-            "Error descargando foto de WhatsApp: %s",
-
-            error
-        )
-
-        return None
-
-
-    folder = sender_folder(
-        sender
-    )
-
-
-    folder.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-
-    extension = get_extension_from_mime(
-        mime_type
-    )
-
-
-    filepath = (
-
-        folder
-
-        /
-
-        f"foto_{photo_number:02d}{extension}"
-
-    )
-
-
-    filepath.write_bytes(
-        image_response.content
-    )
-
-
-    logger.info(
-
-        "FOTO %s/10 DESCARGADA | %s",
-
-        photo_number,
-
-        filepath
-
-    )
-
-
-    return str(
-        filepath
-    )
-
-
-# =========================================================
-# NOMBRE ARCHIVO
-# =========================================================
-
-def safe_filename(text):
-
-    text = re.sub(
-
-        r"[^a-zA-Z0-9_-]+",
-
-        "_",
-
-        (
-            text
-            or
-            "portada"
-        ).strip()
-
-    )
-
-
-    return (
-        text[:80]
-        or
-        "portada"
-    )
-
-
-# =========================================================
-# PROMPT DEFINITIVO SUPERBIKERS
-# =========================================================
-
-def build_superbikers_prompt(moto):
-
-    title = (
-
-        moto.get(
-            "cover_title"
-        )
-
-        or
-
-        "MOTOCICLETA DISPONIBLE"
-
-    )
-
-
-    price = (
-
-        moto.get(
-            "cover_price"
-        )
-
-        or
-
-        "PRECIO DISPONIBLE"
-
-    )
-
-
-    flags = (
-        moto.get(
-            "flags"
-        )
-        or
-        []
-    )
-
-
-    flag_instruction = ""
-
-
-    if flags:
-
-        flag_instruction = f"""
-ETIQUETA OPCIONAL:
-
-Agregar:
-
-"{flags[0]}"
-
-Pequeno y discreto cerca del titulo.
-
-No debe competir con el titulo,
-la motocicleta ni el precio.
-"""
-
-
-    return f"""
-EDITAR LA FOTOGRAFIA PROPORCIONADA
-PARA CREAR UNA PORTADA PUBLICITARIA
-PREMIUM DE SUPERBIKERS SHOP.
-
-LA FOTOGRAFIA DE ENTRADA ES LA BASE
-PRINCIPAL.
-
-DEBE SEGUIR SIENDO CLARAMENTE
-RECONOCIBLE.
-
-
-==================================================
-
-PRIORIDAD ABSOLUTA:
-
-CONSERVAR LA MOTOCICLETA
-Y EL FONDO LO MAS ORIGINAL POSIBLE.
-
-NO cambiar:
-
-- modelo
-- color
-- carenados
-- faros
-- escape
-- rines
-- llantas
-- asiento
-- tanque
-- accesorios
-- proporciones
-- piezas mecanicas
-
-NO inventar modificaciones.
-
-Mantener el fondo original
-tanto como sea posible.
-
-Solamente mejorar naturalmente:
-
-- iluminacion
-- contraste
-- claridad
-- nitidez
-- profundidad
-- sombras suaves
-
-Debe parecer una fotografia real.
-
-NO convertir la foto
-en una ilustracion.
-
-
-==================================================
-
-JERARQUIA VISUAL OBLIGATORIA:
-
-
-1. TITULO GRANDE ARRIBA
-
-Texto EXACTO:
-
-"{title}"
-
-
-El titulo debe:
-
-- estar arriba
-- ser GRANDE
-- ser claramente mas grande que el precio
-- ocupar aproximadamente 15-20%
-  de la parte superior
-- tener estilo brush / graffiti
-  automotriz
-- ser agresivo pero limpio
-- verse premium
-- ser facil de leer
-
-Puede usar:
-
-- blanco
-- negro
-- un color de acento inspirado
-  en la motocicleta
-
-NO tapar partes importantes
-de la moto.
-
-
-==================================================
-
-2. MOTOCICLETA PROTAGONISTA
-
-La motocicleta debe permanecer:
-
-- grande
-- completa
-- visible
-- dominante
-- realista
-
-NO colocar textos importantes
-encima de:
-
-- tanque
-- carenado
-- asiento
-- ruedas
-
-NO cubrir la motocicleta
-con graficos innecesarios.
-
-
-==================================================
-
-3. PRECIO DEBAJO DE LA MOTO
-
-Texto EXACTO:
-
-"{price}"
-
-
-MUY IMPORTANTE:
-
-El precio debe estar:
-
-CENTRADO DEBAJO
-DE LA MOTOCICLETA.
-
-
-NO poner el precio:
-
-- arriba
-- junto al titulo
-- sobre la motocicleta
-
-
-Usar un recuadro:
-
-- COMPACTO
-- PEQUENO
-- deportivo
-- premium
-
-
-El recuadro debe ocupar
-aproximadamente 30-35%
-del ancho total.
-
-
-Debe ser MUCHO MAS PEQUENO
-que el titulo.
-
-
-Estilo sugerido:
-
-- fondo oscuro
-- borde fino
-- acento inspirado
-  en el color de la motocicleta
-- buena legibilidad
-
-
-El precio debe destacar,
-pero debe ser secundario
-al titulo.
-
-
-==================================================
-
-4. SUPERBIKERS SHOP HASTA ABAJO
-
-Texto EXACTO:
-
-"Superbikers Shop"
-
-
-Debe estar:
-
-- centrado
-- hasta abajo
-- pequeno
-- debajo del precio
-
-
-Tipografia:
-
-- brush
-- graffiti
-- exotica
-- automotriz
-
-
-Debe verse integrado
-al diseño.
-
-NO como texto generico.
-
-
-==================================================
-
-{flag_instruction}
-
-
-ACENTOS GRAFICOS:
-
-Se permiten:
-
-- pincelazos
-- trazos dinamicos
-- detalles discretos
-  en bordes o esquinas
-
-Usar colores inspirados
-en la motocicleta
-mas negro y blanco.
-
-NO sobrecargar.
-
-Mantener aspecto
-de publicidad premium
-de motocicletas deportivas.
-
-
-==================================================
-
-NO AGREGAR:
-
-- telefonos
-- direcciones
-- hashtags
-- vendedores
-- millas
-- pedimento
-- factura
-- condiciones de venta
-- textos adicionales
-- marcas de agua nuevas
-- logotipos inventados
-
-
-==================================================
-
-REGLA FINAL:
-
-LA IMAGEN DEBE LEERSE
-VISUALMENTE EN ESTE ORDEN:
-
-
-TITULO GRANDE ARRIBA
-
-↓
-
-MOTOCICLETA
-
-↓
-
-PRECIO PEQUENO
-DEBAJO DE LA MOTO
-
-↓
-
-SUPERBIKERS SHOP
-HASTA ABAJO
-
-
-NO CAMBIAR ESTE ORDEN.
-
-
-La composicion debe parecer
-una publicidad profesional
-creada especificamente
-para Superbikers Shop.
-
-NO debe parecer
-una plantilla generica.
-""".strip()
-
-
-# =========================================================
-# OPENAI
-# =========================================================
-
-def create_cover_with_openai(
-    moto,
-    sender
-):
-
-    if not openai_client:
-
-        logger.error(
-            "Falta OPENAI_API_KEY"
-        )
-
-        return None
-
-
-    cover_path = (
-        moto.get(
-            "cover_file_path"
-        )
-    )
-
-
-    if (
-        not cover_path
-        or
-        not Path(
-            cover_path
-        ).exists()
-    ):
-
-        logger.error(
-            "No existe foto de portada"
-        )
-
-        return None
-
-
-    prompt = build_superbikers_prompt(
-        moto
-    )
-
-
-    logger.info(
-        "=============== OPENAI PORTADA ==============="
-    )
-
-
-    logger.info(
-        "Titulo: %s",
-        moto.get(
-            "cover_title"
-        )
-    )
-
-
-    logger.info(
-        "Precio: %s",
-        moto.get(
-            "cover_price"
-        )
-    )
-
-
-    logger.info(
-        "Foto base: %s",
-        cover_path
-    )
-
-
-    try:
-
-        with open(
-            cover_path,
-            "rb"
-        ) as image_file:
-
-
-            result = (
-                openai_client
-                .images
-                .edit(
-
-                    model=
-                        "gpt-image-2.5-sunburst",
-
-                    image=
-                        image_file,
-
-                    prompt=
-                        prompt,
-
-                    size=
-                        "1024x1536",
-
-                    quality=
-                        "high"
-
-                )
-            )
-
-
-    except Exception as error:
-
-        logger.exception(
-
-            "ERROR GENERANDO PORTADA OPENAI: %s",
-
-            error
-
-        )
-
-        return None
-
-
-    if (
-        not result.data
-        or
-        not result.data[0].b64_json
-    ):
-
-        logger.error(
-            "OpenAI no devolvio imagen"
-        )
-
-        return None
-
-
-    try:
-
-        image_bytes = (
-            base64.b64decode(
-                result.data[0].b64_json
-            )
-        )
-
-
-    except Exception as error:
-
-        logger.exception(
-
-            "Error decodificando imagen: %s",
-
-            error
-
-        )
-
-        return None
-
-
-    public_id = sender_key(
-        sender
-    )
-
-
-    output_folder = (
-
-        sender_folder(
-            sender
-        )
-
-        /
-
-        "generated"
-
-    )
-
-
-    output_folder.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-
-    filename = (
-
-        safe_filename(
-            moto.get(
-                "cover_title"
-            )
-        )
-
-        +
-
-        "_openai.png"
-
-    )
-
-
-    output_path = (
-
-        output_folder
-
-        /
-
-        filename
-
-    )
-
-
-    output_path.write_bytes(
-        image_bytes
-    )
-
-
-    url = (
-
-        f"{BASE_URL}"
-        f"/generated/"
-        f"{public_id}/"
-        f"{filename}"
-
-    )
-
-
-    logger.info(
-        "PORTADA OPENAI CREADA"
-    )
-
-
-    logger.info(
-        "PORTADA OPENAI URL: %s",
-        url
-    )
-
-
-    logger.info(
-        "=============================================="
-    )
-
-
-    return {
-
-        "file_path":
-            str(output_path),
-
-        "filename":
-            filename,
-
-        "url":
-            url
-
-    }
-
-
-# =========================================================
-# CREAR MOTO
-# =========================================================
-
-def build_moto_from_session(
-    session
-):
-
-    text = session[
-        "text"
-    ]
-
-
-    return {
-
-        "full_text_original":
-            text,
-
-        "cover_title":
-            extract_cover_title(
-                text
-            ),
-
-        "cover_price":
-            extract_price(
-                text
-            ),
-
-        "flags":
-            extract_flags(
-                text
-            ),
-
-        "hashtags":
-            extract_hashtags(
-                text
-            ),
-
-        "total_photos":
-            10,
-
-        "cover_media_id":
-            session["photos"][0][
-                "media_id"
-            ],
-
-        "cover_file_path":
-            session["photos"][0][
-                "file_path"
-            ],
-
-        "photos":
-            [
-                dict(photo)
-                for photo
-                in session["photos"]
-            ],
-
-        "gallery_photos":
-            [
-                dict(photo)
-                for photo
-                in session["photos"][1:]
-            ]
-
-    }
-
-
-# =========================================================
-# PROCESAR EN SEGUNDO PLANO
-# =========================================================
-
-def process_moto_background(
-    sender,
-    snapshot
-):
-
-    try:
-
-        moto = build_moto_from_session(
-            snapshot
-        )
-
-
-        generated_cover = (
-            create_cover_with_openai(
-                moto,
-                sender
-            )
-        )
-
-
-        if generated_cover:
-
-
-            moto[
-                "generated_cover"
-            ] = generated_cover
-
-
-            logger.info(
-
-                "\n"
-                "================ MOTO FINAL ================\n"
-                "%s\n"
-                "============================================",
-
-                json.dumps(
-                    moto,
-                    ensure_ascii=False,
-                    indent=2
-                )
-
-            )
-
-
-            with state_lock:
-
-                pending_motos[
-                    sender
-                ] = new_session()
-
-
-            logger.info(
-                "PORTADA GENERADA CORRECTAMENTE"
-            )
-
-
-        else:
-
-
-            with state_lock:
-
-                current = pending_motos.get(
-                    sender
-                )
-
-
-                if current:
-
-                    current[
-                        "processing"
-                    ] = False
-
-
-            logger.error(
-                "OPENAI NO GENERO LA PORTADA"
-            )
-
-
-            logger.error(
-                "LAS 10 FOTOS Y EL TEXTO SE CONSERVAN"
-            )
-
-
-            logger.error(
-                "ENVIA REINTENTAR PARA VOLVER A INTENTAR"
-            )
-
-
-    except Exception as error:
-
-
-        logger.exception(
-
-            "Error inesperado procesando moto: %s",
-
-            error
-
-        )
-
-
-        with state_lock:
-
-            current = pending_motos.get(
-                sender
-            )
-
-
-            if current:
-
-                current[
-                    "processing"
-                ] = False
-
-
-# =========================================================
-# INICIAR PROCESO
-# =========================================================
-
-def maybe_start_processing(
-    sender
-):
-
-    with state_lock:
-
-
-        session = pending_motos.get(
-            sender
-        )
-
-
-        if not session:
-
-            return False
-
-
-        if (
-            len(
-                session["photos"]
-            )
-            != 10
-        ):
-
-            return False
-
-
-        if not session[
-            "text"
-        ]:
-
-            return False
-
-
-        if session.get(
-            "processing"
-        ):
-
-            return False
-
-
-        if any(
-
-            not photo.get(
-                "file_path"
-            )
-
-            for photo
-            in session["photos"]
-
-        ):
-
-            logger.error(
-                "Una foto no se descargo correctamente"
-            )
-
-            return False
-
-
-        session[
-            "processing"
-        ] = True
-
-
-        snapshot = {
-
-            "photos":
-                [
-                    dict(photo)
-                    for photo
-                    in session["photos"]
-                ],
-
-            "text":
-                session["text"]
-
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "text",
+        "text": {
+            "body": text_body
         }
+    }
 
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        logger.info("WHATSAPP TEXT RESPONSE: %s | %s", response.status_code, response.text[:500])
+        return response
+    except Exception as e:
+        logger.exception("Error enviando texto por WhatsApp: %s", e)
+        return None
+
+
+def send_whatsapp_image_by_link(to_number, image_url, caption="Aquí está tu portada"):
+    if not WHATSAPP_ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        logger.error("Falta WHATSAPP_ACCESS_TOKEN o PHONE_NUMBER_ID.")
+        return None
+
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "image",
+        "image": {
+            "link": image_url,
+            "caption": caption
+        }
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        logger.info("WHATSAPP IMAGE RESPONSE: %s | %s", response.status_code, response.text[:500])
+        return response
+    except Exception as e:
+        logger.exception("Error enviando imagen por WhatsApp: %s", e)
+        return None
+
+
+# =========================
+# DESCARGA DE IMÁGENES
+# =========================
+def download_whatsapp_image(media_id, sender, photo_number):
+    if not WHATSAPP_ACCESS_TOKEN:
+        logger.error("Falta WHATSAPP_ACCESS_TOKEN.")
+        return None
+
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    info_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}"
+
+    try:
+        info_response = requests.get(info_url, headers=headers, timeout=30)
+    except requests.RequestException as exc:
+        logger.exception("Error consultando media_id=%s: %s", media_id, exc)
+        return None
+
+    if info_response.status_code != 200:
+        logger.error("No se pudo obtener URL de foto. %s | %s", info_response.status_code, info_response.text[:500])
+        return None
+
+    media_info = info_response.json()
+    media_url = media_info.get("url")
+    mime_type = media_info.get("mime_type", "image/jpeg")
+
+    if not media_url:
+        logger.error("Meta no devolvió URL para media_id=%s", media_id)
+        return None
+
+    try:
+        image_response = requests.get(media_url, headers=headers, timeout=60)
+    except requests.RequestException as exc:
+        logger.exception("Error descargando media_id=%s: %s", media_id, exc)
+        return None
+
+    if image_response.status_code != 200:
+        logger.error("No se pudo descargar la foto. %s | %s", image_response.status_code, image_response.text[:500])
+        return None
+
+    extension = get_extension_from_mime(mime_type)
+    folder = TMP_ROOT / sender
+    folder.mkdir(parents=True, exist_ok=True)
+
+    filepath = folder / f"foto_{photo_number:02d}{extension}"
+    filepath.write_bytes(image_response.content)
+
+    logger.info("FOTO %s/10 DESCARGADA | %s", photo_number, filepath)
+    return str(filepath)
+
+
+# =========================
+# PARSEO DE MOTO COMPLETA
+# =========================
+def finalize_moto(sender):
+    session = pending_motos.get(sender)
+
+    if not session:
+        return None
+
+    if len(session["photos"]) != 10:
+        return None
+
+    if not session["text"]:
+        return None
+
+    if any(not photo.get("file_path") for photo in session["photos"]):
+        logger.error("Hay fotos sin descargar correctamente.")
+        return None
+
+    text = session["text"]
+
+    moto = {
+        "full_text_original": text,
+        "cover_title": extract_cover_title(text),
+        "cover_price": extract_price(text),
+        "hashtags": extract_hashtags(text),
+        "flags": extract_flags(text),
+        "total_photos": 10,
+        "cover_media_id": session["photos"][0]["media_id"],
+        "cover_file_path": session["photos"][0]["file_path"],
+        "photos": session["photos"],
+        "gallery_photos": session["photos"][1:]
+    }
 
     logger.info(
-        "MOTO COMPLETA DETECTADA"
+        "\n================ MOTO COMPLETA DETECTADA ================\n%s\n=========================================================\n",
+        json.dumps(moto, ensure_ascii=False, indent=2)
     )
 
-
-    logger.info(
-        "GENERANDO PORTADA EN SEGUNDO PLANO"
-    )
-
-
-    thread = threading.Thread(
-
-        target=
-            process_moto_background,
-
-        args=
-            (
-                sender,
-                snapshot
-            ),
-
-        daemon=
-            True
-
-    )
+    # limpiamos la sesión para el siguiente lote
+    pending_motos[sender] = {"photos": [], "text": ""}
+    return moto
 
 
-    thread.start()
+# =========================
+# OPENAI - GENERAR PORTADA
+# =========================
+def build_cover_prompt(title, price, flags):
+    flags_text = ", ".join(flags) if flags else ""
 
-
-    return True
-
-
-# =========================================================
-# RECIBIR WHATSAPP
-# =========================================================
-
-@app.post("/webhook/whatsapp")
-def receive_webhook():
-
-    payload = (
-        request.get_json(
-            silent=True
+    extra_flag_instruction = ""
+    if flags_text:
+        extra_flag_instruction = (
+            f'Agrega en pequeño cerca del título etiquetas o subtítulos relacionados con: "{flags_text}". '
         )
-        or {}
-    )
 
-
-    logger.info(
-        "WEBHOOK RECIBIDO"
-    )
-
-
-    for entry in payload.get(
-        "entry",
-        []
-    ):
-
-
-        for change in entry.get(
-            "changes",
-            []
-        ):
-
-
-            value = change.get(
-                "value",
-                {}
-            )
-
-
-            for message in value.get(
-                "messages",
-                []
-            ):
-
-
-                message_id = (
-                    message.get(
-                        "id"
-                    )
-                )
-
-
-                if message_id:
-
-
-                    with state_lock:
-
-
-                        if (
-                            message_id
-                            in seen_message_ids
-                        ):
-
-                            logger.info(
-                                "MENSAJE DUPLICADO IGNORADO"
-                            )
-
-                            continue
-
-
-                        seen_message_ids.add(
-                            message_id
-                        )
-
-
-                        if (
-                            len(
-                                seen_message_ids
-                            )
-                            > 5000
-                        ):
-
-                            seen_message_ids.clear()
-
-                            seen_message_ids.add(
-                                message_id
-                            )
-
-
-                sender = (
-                    message.get(
-                        "from"
-                    )
-                )
-
-
-                if not sender:
-                    continue
-
-
-                with state_lock:
-
-
-                    session = (
-                        pending_motos
-                        .setdefault(
-                            sender,
-                            new_session()
-                        )
-                    )
-
-
-                message_type = (
-                    message.get(
-                        "type"
-                    )
-                )
-
-
-                # =====================================
-                # FOTO
-                # =====================================
-
-                if (
-                    message_type
-                    ==
-                    "image"
-                ):
-
-
-                    with state_lock:
-
-
-                        if session.get(
-                            "processing"
-                        ):
-
-                            logger.warning(
-                                "PORTADA EN PROCESO"
-                            )
-
-                            continue
-
-
-                        current_count = len(
-                            session[
-                                "photos"
-                            ]
-                        )
-
-
-                    if (
-                        current_count
-                        >= 10
-                    ):
-
-                        logger.warning(
-                            "YA HAY 10 FOTOS"
-                        )
-
-                        logger.warning(
-                            "ENVIA RESET PARA OTRA MOTO"
-                        )
-
-                        continue
-
-
-                    image = (
-                        message.get(
-                            "image",
-                            {}
-                        )
-                    )
-
-
-                    media_id = (
-                        image.get(
-                            "id"
-                        )
-                    )
-
-
-                    caption = normalize_text(
-
-                        image.get(
-                            "caption",
-                            ""
-                        )
-
-                    )
-
-
-                    if not media_id:
-                        continue
-
-
-                    photo_number = (
-                        current_count
-                        +
-                        1
-                    )
-
-
-                    file_path = (
-                        download_whatsapp_image(
-
-                            media_id,
-
-                            sender,
-
-                            photo_number
-
-                        )
-                    )
-
-
-                    if file_path:
-
-
-                        with state_lock:
-
-
-                            session = (
-
-                                pending_motos
-                                .setdefault(
-                                    sender,
-                                    new_session()
-                                )
-
-                            )
-
-
-                            session[
-                                "photos"
-                            ].append({
-
-                                "number":
-                                    photo_number,
-
-                                "media_id":
-                                    media_id,
-
-                                "file_path":
-                                    file_path
-
-                            })
-
-
-                            if (
-                                caption
-                                and
-                                not session[
-                                    "text"
-                                ]
-                            ):
-
-                                session[
-                                    "text"
-                                ] = caption
-
-
-                        logger.info(
-
-                            "FOTO %s/10 REGISTRADA",
-
-                            photo_number
-
-                        )
-
-
-                        if (
-                            photo_number
-                            == 1
-                        ):
-
-                            logger.info(
-                                "FOTO #1 = PORTADA"
-                            )
-
-
-                        if (
-                            photo_number
-                            == 10
-                        ):
-
-                            logger.info(
-                                "LAS 10 FOTOS YA ESTAN COMPLETAS"
-                            )
-
-
-                # =====================================
-                # TEXTO
-                # =====================================
-
-                elif (
-                    message_type
-                    ==
-                    "text"
-                ):
-
-
-                    text = normalize_text(
-
-                        message.get(
-                            "text",
-                            {}
-                        ).get(
-                            "body",
-                            ""
-                        )
-
-                    )
-
-
-                    command = (
-                        text
-                        .strip()
-                        .upper()
-                    )
-
-
-                    # ---------------------------------
-                    # RESET
-                    # ---------------------------------
-
-                    if (
-                        command
-                        ==
-                        "RESET"
-                    ):
-
-
-                        with state_lock:
-
-
-                            pending_motos[
-                                sender
-                            ] = new_session()
-
-
-                        logger.info(
-                            "SESION REINICIADA"
-                        )
-
-                        continue
-
-
-                    # ---------------------------------
-                    # REINTENTAR
-                    # ---------------------------------
-
-                    if (
-                        command
-                        ==
-                        "REINTENTAR"
-                    ):
-
-
-                        logger.info(
-                            "REINTENTO SOLICITADO"
-                        )
-
-
-                        maybe_start_processing(
-                            sender
-                        )
-
-                        continue
-
-
-                    with state_lock:
-
-
-                        session = (
-
-                            pending_motos
-                            .setdefault(
-                                sender,
-                                new_session()
-                            )
-
-                        )
-
-
-                        if session.get(
-                            "processing"
-                        ):
-
-                            logger.warning(
-                                "PORTADA EN PROCESO"
-                            )
-
-                            continue
-
-
-                        session[
-                            "text"
-                        ] = text
-
-
-                    logger.info(
-                        "TEXTO RECIBIDO"
-                    )
-
-
-                # =====================================
-                # INTENTAR GENERAR
-                # =====================================
-
-                maybe_start_processing(
-                    sender
-                )
-
-
-    # RESPONDER INMEDIATAMENTE A META
-
+    price_instruction = ""
+    if price:
+        price_instruction = (
+            f'Coloca EXACTAMENTE el precio "{price}" dentro de un recuadro pequeño debajo de la moto. '
+            'Es obligatorio que aparezca el precio exacto y NO se debe reemplazar por frases como '
+            '"PRECIO DISPONIBLE", "CONSULTA PRECIO" o similares. '
+        )
+    else:
+        price_instruction = (
+            'Si no hay precio detectado, coloca un recuadro pequeño abajo de la moto con estilo limpio. '
+        )
+
+    prompt = f"""
+Edita la imagen proporcionada y conviértela en un post publicitario vertical profesional para motocicleta.
+
+IMPORTANTE:
+- Conserva la moto y el fondo lo más originales posible.
+- Estilo visual: limpio, contrastado, elegante, publicitario, moderno.
+- La portada debe verse como un anuncio premium de Superbikers Shop.
+- Sin saturar demasiado la composición.
+- No cambies el modelo de la moto.
+- Mantén la moto protagonista y nítida.
+- Iluminación atractiva y sombras suaves.
+- Sin bordes gruesos innecesarios.
+
+TEXTO:
+- Título principal grande en la parte superior, más grande que antes, con tipografía agresiva tipo brush/graffiti automotriz.
+- El texto del título debe decir EXACTAMENTE: "{title}".
+- {extra_flag_instruction}
+- {price_instruction}
+- En la parte inferior agrega "Superbikers Shop" en estilo brush/graffiti limpio.
+- El recuadro del precio debe ser pequeño y estar claramente DEBAJO de la moto.
+- Jamás cambies el texto del precio por otra cosa.
+
+COMPOSICIÓN:
+- Formato vertical tipo post para redes sociales.
+- Título arriba grande.
+- Recuadro del precio abajo de la moto.
+- Logo/nombre "Superbikers Shop" pequeño en la parte inferior.
+- Debe sentirse como una portada de venta de moto de alta calidad.
+"""
+    return prompt.strip()
+
+
+def create_cover_with_openai(sender, moto):
+    if not OPENAI_API_KEY:
+        raise ValueError("Falta OPENAI_API_KEY")
+
+    if not BASE_URL:
+        raise ValueError("Falta BASE_URL")
+
+    cover_file = moto["cover_file_path"]
+    title = moto["cover_title"] or "MOTO DISPONIBLE"
+    price = moto["cover_price"] or ""
+    flags = moto["flags"] or []
+
+    logger.info("=========== OPENAI PORTADA ===========")
+    logger.info("Título: %s", title)
+    logger.info("Precio: %s", price)
+    logger.info("Foto base: %s", cover_file)
+
+    prompt = build_cover_prompt(title, price, flags)
+
+    with open(cover_file, "rb") as image_file:
+        result = openai_client.images.edit(
+            model="gpt-image-1",
+            image=image_file,
+            prompt=prompt
+        )
+
+    image_b64 = result.data[0].b64_json
+    image_bytes = base64.b64decode(image_b64)
+
+    generated_dir = TMP_ROOT / sender / "generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{slugify(title)}_openai.png"
+    output_path = generated_dir / filename
+    output_path.write_bytes(image_bytes)
+
+    public_url = f"{BASE_URL}/generated/{sender}/{filename}"
+
+    generated_cover = {
+        "file_path": str(output_path),
+        "url": public_url,
+        "filename": filename
+    }
+
+    logger.info("PORTADA GENERADA: %s", json.dumps(generated_cover, ensure_ascii=False, indent=2))
+    return generated_cover
+
+
+# =========================
+# RUTAS
+# =========================
+@app.get("/")
+def home():
     return jsonify({
-
-        "success":
-            True
-
+        "status": "ok",
+        "service": "Superbikers WhatsApp Webhook"
     }), 200
 
 
-# =========================================================
-# START
-# =========================================================
+@app.get("/privacy")
+def privacy():
+    return """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <title>Política de Privacidad - Superbikers Shop</title>
+    </head>
+    <body style="font-family:Arial;max-width:800px;margin:40px auto;line-height:1.6;">
+        <h1>Política de Privacidad de Superbikers Shop</h1>
+        <p>En Superbikers Shop respetamos la privacidad de nuestros clientes y usuarios.</p>
+        <p>La información recibida a través de WhatsApp se utiliza para atender solicitudes, generar portadas y gestionar publicaciones.</p>
+        <p>No vendemos información personal.</p>
+        <p>Última actualización: septiembre de 2026.</p>
+    </body>
+    </html>
+    """, 200
 
+
+@app.get("/webhook/whatsapp")
+def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        logger.info("Webhook verificado correctamente.")
+        return challenge, 200
+
+    return "Forbidden", 403
+
+
+@app.get("/generated/<sender>/<filename>")
+def serve_generated_image(sender, filename):
+    folder = TMP_ROOT / sender / "generated"
+    return send_from_directory(folder, filename)
+
+
+# =========================
+# WEBHOOK PRINCIPAL
+# =========================
+@app.post("/webhook/whatsapp")
+def receive_webhook():
+    payload = request.get_json(silent=True) or {}
+    logger.info("WEBHOOK RECIBIDO")
+    logger.info(json.dumps(payload, ensure_ascii=False))
+
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+
+            for message in value.get("messages", []):
+                sender = message.get("from")
+                if not sender:
+                    continue
+
+                session = get_session(sender)
+                message_type = message.get("type")
+
+                # TEXTO
+                if message_type == "text":
+                    text = normalize_text(message.get("text", {}).get("body", ""))
+                    session["text"] = text
+                    logger.info("TEXTO RECIBIDO")
+                    logger.info(text)
+
+                # IMAGEN
+                elif message_type == "image":
+                    image = message.get("image", {})
+                    media_id = image.get("id")
+                    caption = normalize_text(image.get("caption", ""))
+
+                    if media_id and len(session["photos"]) < 10:
+                        photo_number = len(session["photos"]) + 1
+                        file_path = download_whatsapp_image(
+                            media_id=media_id,
+                            sender=sender,
+                            photo_number=photo_number
+                        )
+
+                        session["photos"].append({
+                            "number": photo_number,
+                            "media_id": media_id,
+                            "file_path": file_path
+                        })
+
+                        logger.info("FOTO %s/10 REGISTRADA | %s", photo_number, file_path)
+
+                        if photo_number == 1:
+                            logger.info("FOTO #1 = PORTADA")
+
+                        if photo_number == 10:
+                            logger.info("LAS 10 FOTOS YA ESTÁN COMPLETAS")
+
+                    if caption:
+                        session["text"] = caption
+
+                moto = finalize_moto(sender)
+
+                if moto:
+                    try:
+                        logger.info("GENERANDO PORTADA CON OPENAI...")
+                        generated_cover = create_cover_with_openai(sender, moto)
+
+                        caption = f"Portada lista ✅\n{moto['cover_title']}"
+                        if moto["cover_price"]:
+                            caption += f"\n{moto['cover_price']}"
+
+                        send_whatsapp_image_by_link(
+                            to_number=sender,
+                            image_url=generated_cover["url"],
+                            caption=caption
+                        )
+
+                        # también manda el link por texto por si quieres abrirlo directo
+                        send_whatsapp_text(
+                            to_number=sender,
+                            text_body=f"Aquí está tu portada:\n{generated_cover['url']}"
+                        )
+
+                    except Exception as e:
+                        logger.exception("Error generando portada con OpenAI: %s", e)
+                        send_whatsapp_text(
+                            to_number=sender,
+                            text_body="Hubo un error generando la portada. Revisa logs y vuelve a intentar."
+                        )
+
+    return jsonify({"received": True}), 200
+
+
+# =========================
+# MAIN
+# =========================
 if __name__ == "__main__":
-
-    port = int(
-
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-
-    )
-
-
-    app.run(
-
-        host=
-            "0.0.0.0",
-
-        port=
-            port
-
-    )
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)

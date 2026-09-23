@@ -118,6 +118,41 @@ def safe_filename(text):
 
 
 # =========================================================
+# NORMALIZAR NUMERO DESTINATARIO
+# =========================================================
+
+def normalize_whatsapp_recipient(number):
+
+    digits = re.sub(
+        r"\D",
+        "",
+        number or ""
+    )
+
+    # México:
+    # algunos webhooks pueden entregar 521XXXXXXXXXX
+    # Meta puede tener autorizado 52XXXXXXXXXX
+    if (
+        digits.startswith("521")
+        and
+        len(digits) == 13
+    ):
+
+        digits = (
+            "52"
+            +
+            digits[3:]
+        )
+
+    logger.info(
+        "DESTINATARIO NORMALIZADO: %s",
+        digits
+    )
+
+    return digits
+
+
+# =========================================================
 # PRECIO
 # =========================================================
 
@@ -137,7 +172,6 @@ def price_from_candidate(value):
     except ValueError:
         return ""
 
-    # rango razonable para precio de motocicleta
     if number < 10000 or number > 5000000:
         return ""
 
@@ -155,10 +189,11 @@ def extract_price(text):
         if line.strip()
     ]
 
-    # -----------------------------------------
+
+    # =====================================================
     # PRIORIDAD 1:
     # SEGUNDA LINEA
-    # -----------------------------------------
+    # =====================================================
 
     if len(lines) >= 2:
 
@@ -184,10 +219,10 @@ def extract_price(text):
                 return price
 
 
-    # -----------------------------------------
+    # =====================================================
     # PRIORIDAD 2:
-    # NUMERO CON SIGNO $
-    # -----------------------------------------
+    # SIGNO $
+    # =====================================================
 
     match = re.search(
         r'\$\s*'
@@ -205,10 +240,10 @@ def extract_price(text):
             return price
 
 
-    # -----------------------------------------
+    # =====================================================
     # PRIORIDAD 3:
     # PALABRA PRECIO
-    # -----------------------------------------
+    # =====================================================
 
     match = re.search(
         r'(?i)\bprecio\b'
@@ -300,13 +335,15 @@ def extract_cover_title(text):
         if extract_price(line):
             continue
 
-        return clean_cover_title(line)
+        return clean_cover_title(
+            line
+        )
 
     return ""
 
 
 # =========================================================
-# FLAGS / ETIQUETAS
+# FLAGS
 # =========================================================
 
 def extract_flags(text):
@@ -359,7 +396,7 @@ def get_extension_from_mime(mime_type):
 
 
 # =========================================================
-# WHATSAPP - TEXTO
+# WHATSAPP - ENVIAR TEXTO
 # =========================================================
 
 def send_whatsapp_text(
@@ -367,6 +404,10 @@ def send_whatsapp_text(
     phone_number_id,
     message
 ):
+
+    recipient = normalize_whatsapp_recipient(
+        recipient
+    )
 
     phone_number_id = (
         phone_number_id
@@ -381,7 +422,7 @@ def send_whatsapp_text(
     ):
 
         logger.error(
-            "Falta token o PHONE_NUMBER_ID para enviar mensaje"
+            "Falta token o PHONE_NUMBER_ID"
         )
 
         return False
@@ -423,10 +464,12 @@ def send_whatsapp_text(
             timeout=60
         )
 
+
         logger.info(
             "WHATSAPP TEXT STATUS: %s",
             response.status_code
         )
+
 
         if response.status_code >= 400:
 
@@ -437,12 +480,14 @@ def send_whatsapp_text(
 
             return False
 
+
         return True
+
 
     except Exception as error:
 
         logger.exception(
-            "Error enviando texto a WhatsApp: %s",
+            "Error enviando texto: %s",
             error
         )
 
@@ -450,7 +495,7 @@ def send_whatsapp_text(
 
 
 # =========================================================
-# WHATSAPP - SUBIR PORTADA
+# SUBIR PORTADA A WHATSAPP
 # =========================================================
 
 def upload_media_to_whatsapp(
@@ -463,6 +508,7 @@ def upload_media_to_whatsapp(
         or
         PHONE_NUMBER_ID
     )
+
 
     url = (
         f"https://graph.facebook.com/"
@@ -528,9 +574,7 @@ def upload_media_to_whatsapp(
             return None
 
 
-        result = response.json()
-
-        return result.get(
+        return response.json().get(
             "id"
         )
 
@@ -538,7 +582,7 @@ def upload_media_to_whatsapp(
     except Exception as error:
 
         logger.exception(
-            "Error subiendo portada a WhatsApp: %s",
+            "Error subiendo portada: %s",
             error
         )
 
@@ -546,7 +590,7 @@ def upload_media_to_whatsapp(
 
 
 # =========================================================
-# WHATSAPP - ENVIAR PORTADA
+# ENVIAR PORTADA AL WHATSAPP
 # =========================================================
 
 def send_cover_to_whatsapp(
@@ -556,6 +600,11 @@ def send_cover_to_whatsapp(
     title,
     price
 ):
+
+    recipient = normalize_whatsapp_recipient(
+        recipient
+    )
+
 
     phone_number_id = (
         phone_number_id
@@ -656,7 +705,7 @@ def send_cover_to_whatsapp(
 
 
 # =========================================================
-# DESCARGAR FOTO WHATSAPP
+# DESCARGAR IMAGEN
 # =========================================================
 
 def try_download_url(
@@ -666,6 +715,7 @@ def try_download_url(
 
     if not media_url:
         return None
+
 
     for attempt in range(3):
 
@@ -677,27 +727,32 @@ def try_download_url(
                 timeout=60
             )
 
+
             if response.status_code == 200:
 
                 return response.content
 
+
             logger.warning(
-                "Descarga directa intento %s: HTTP %s",
+                "Descarga intento %s: HTTP %s",
                 attempt + 1,
                 response.status_code
             )
 
+
         except requests.RequestException as error:
 
             logger.warning(
-                "Descarga directa intento %s fallo: %s",
+                "Descarga intento %s fallo: %s",
                 attempt + 1,
                 error
             )
 
+
         time.sleep(
             0.8 * (attempt + 1)
         )
+
 
     return None
 
@@ -728,10 +783,9 @@ def download_whatsapp_image(
     image_bytes = None
 
 
-    # =========================================
-    # INTENTO 1:
-    # URL QUE YA MANDA META
-    # =========================================
+    # =====================================================
+    # INTENTO URL DEL WEBHOOK
+    # =====================================================
 
     if direct_url:
 
@@ -741,10 +795,9 @@ def download_whatsapp_image(
         )
 
 
-    # =========================================
-    # INTENTO 2:
-    # PEDIR URL POR MEDIA ID
-    # =========================================
+    # =====================================================
+    # INTENTO POR MEDIA ID
+    # =====================================================
 
     if not image_bytes:
 
@@ -809,10 +862,6 @@ def download_whatsapp_image(
                 error
             )
 
-
-    # =========================================
-    # SOLO GUARDAR SI DESCARGO
-    # =========================================
 
     if not image_bytes:
 
@@ -879,21 +928,19 @@ def build_superbikers_prompt(
     if flags:
 
         flag_instruction = f"""
-Agregar una etiqueta pequena con el texto:
+Agregar una etiqueta pequeña con:
 
 "{flags[0]}"
 
-Debe ser discreta y estar integrada
-cerca del titulo.
+Debe ir integrada cerca del título
+y no competir con la motocicleta.
 """
 
 
     return f"""
-EDITAR LA FOTOGRAFIA PROPORCIONADA
-PARA CREAR UNA PORTADA PUBLICITARIA
-PREMIUM DE SUPERBIKERS SHOP.
-
-NO CREAR UNA MOTOCICLETA DIFERENTE.
+CREAR UNA PORTADA PUBLICITARIA PREMIUM
+DE SUPERBIKERS SHOP EDITANDO
+LA FOTOGRAFIA ORIGINAL.
 
 MANTENER LA MOTOCICLETA
 Y EL FONDO LO MAS ORIGINALES POSIBLE.
@@ -910,75 +957,74 @@ NO CAMBIAR:
 - asiento
 - tanque
 - accesorios
+- piezas
 - proporciones
-- piezas mecanicas
 
-Mejorar solamente:
+SOLO MEJORAR:
 
 - iluminacion
 - contraste
-- claridad
 - nitidez
 - profundidad
 - sombras suaves
 
-Debe seguir pareciendo
-una fotografia real.
+DEBE SEGUIR PARECIENDO
+UNA FOTOGRAFIA REAL.
 
 
 ==================================================
 
-TITULO:
+TITULO GRANDE ARRIBA
 
 ESCRIBIR EXACTAMENTE:
 
 "{title}"
 
 
-Debe estar:
+Debe ser:
 
-- GRANDE
-- en la parte superior
+- grande
 - brush / graffiti automotriz
-- agresivo pero limpio
+- deportivo
+- agresivo
+- elegante
+- legible
 - premium
-- claramente legible
+
 
 El titulo debe ser
-el texto mas grande de la portada.
+el texto principal.
 
 
 ==================================================
 
-MOTOCICLETA:
+MOTOCICLETA
 
 Debe ser la protagonista.
 
-Debe permanecer:
+Grande.
 
-- grande
-- visible
-- completa
-- realista
+Visible.
 
-No tapar partes importantes
-con texto.
+Realista.
+
+No cubrirla innecesariamente.
 
 
 ==================================================
 
-PRECIO:
+PRECIO
 
 ESCRIBIR EXACTAMENTE:
 
 "{price}"
 
 
-REGLA MUY IMPORTANTE:
+MUY IMPORTANTE:
 
-NO cambiar el precio.
+NO CAMBIAR EL PRECIO.
 
-NO escribir:
+NO ESCRIBIR:
 
 - PRECIO DISPONIBLE
 - CONSULTA PRECIO
@@ -986,41 +1032,43 @@ NO escribir:
 - ninguna frase sustituta
 
 
-El recuadro de precio debe estar:
+El precio debe ir:
+
+CENTRADO
 
 DEBAJO DE LA MOTOCICLETA.
 
 
-Debe ser:
+En un recuadro:
 
-- pequeno
+- pequeño
 - compacto
-- centrado
-- deportivo
 - premium
+- deportivo
 
 
-Debe ser claramente
-MAS PEQUENO que el titulo.
+El recuadro del precio
+debe ser mucho más pequeño
+que el titulo.
 
 
 ==================================================
 
-SUPERBIKERS SHOP:
+SUPERBIKERS SHOP
 
-Colocar exactamente:
+Escribir exactamente:
 
 "Superbikers Shop"
 
 Hasta abajo.
 
-Pequeno.
+Pequeño.
 
-Tipografia:
+Tipografía:
 
 - brush
 - graffiti
-- exotica
+- exótica
 - automotriz
 
 
@@ -1029,15 +1077,16 @@ Tipografia:
 {flag_instruction}
 
 
-USAR DETALLES GRAFICOS
-INSPIRADOS EN LOS COLORES
-DE LA MOTOCICLETA.
+DETALLES GRAFICOS:
+
+Usar colores inspirados
+en la motocicleta.
 
 Se permiten:
 
 - pincelazos
-- detalles de esquinas
-- trazos dinamicos
+- líneas deportivas
+- detalles en esquinas
 
 NO sobrecargar.
 
@@ -1045,7 +1094,6 @@ NO sobrecargar.
 ==================================================
 
 ORDEN VISUAL OBLIGATORIO:
-
 
 TITULO GRANDE ARRIBA
 
@@ -1055,7 +1103,7 @@ MOTOCICLETA
 
 ↓
 
-PRECIO PEQUENO
+PRECIO PEQUEÑO
 DEBAJO DE LA MOTO
 
 ↓
@@ -1064,26 +1112,22 @@ SUPERBIKERS SHOP
 HASTA ABAJO
 
 
-NO CAMBIAR ESTE ORDEN.
-
-
 NO AGREGAR:
 
-- telefonos
+- teléfonos
 - direcciones
 - hashtags
 - vendedores
-- pedimento
-- factura
 - millas
-- textos adicionales
+- factura
+- pedimento
+- condiciones de venta
 - marcas de agua nuevas
 
 
 Resultado:
 
-Publicidad profesional
-de motocicletas deportivas
+Post publicitario premium
 para Superbikers Shop.
 """.strip()
 
@@ -1118,7 +1162,7 @@ def create_cover_with_openai(
     ):
 
         logger.error(
-            "No existe la foto de portada"
+            "No existe foto de portada"
         )
 
         return None
@@ -1135,10 +1179,12 @@ def create_cover_with_openai(
         "=============== OPENAI PORTADA ==============="
     )
 
+
     logger.info(
         "Titulo: %s",
         title
     )
+
 
     logger.info(
         "Precio EXACTO: %s",
@@ -1173,7 +1219,6 @@ def create_cover_with_openai(
 
                     quality=
                         "high"
-
                 )
             )
 
@@ -1207,6 +1252,7 @@ def create_cover_with_openai(
             result.data[0].b64_json
         )
 
+
     except Exception as error:
 
         logger.exception(
@@ -1215,11 +1261,6 @@ def create_cover_with_openai(
         )
 
         return None
-
-
-    public_id = sender_key(
-        sender
-    )
 
 
     output_folder = (
@@ -1258,6 +1299,11 @@ def create_cover_with_openai(
     )
 
 
+    public_id = sender_key(
+        sender
+    )
+
+
     url = (
         f"{BASE_URL}"
         f"/generated/"
@@ -1269,6 +1315,7 @@ def create_cover_with_openai(
     logger.info(
         "PORTADA OPENAI CREADA"
     )
+
 
     logger.info(
         "PORTADA OPENAI URL: %s",
@@ -1289,15 +1336,12 @@ def create_cover_with_openai(
 
 
 # =========================================================
-# INICIAR PROCESAMIENTO
+# PROCESAR MOTO
 # =========================================================
 
 def maybe_start_processing(
     sender
 ):
-
-    phone_number_id = ""
-
 
     with state_lock:
 
@@ -1311,15 +1355,6 @@ def maybe_start_processing(
             return False
 
 
-        phone_number_id = (
-            session.get(
-                "phone_number_id"
-            )
-            or
-            PHONE_NUMBER_ID
-        )
-
-
         if session.get(
             "processing"
         ):
@@ -1329,9 +1364,7 @@ def maybe_start_processing(
 
         if (
             len(
-                session[
-                    "photos"
-                ]
+                session["photos"]
             )
             != 10
         ):
@@ -1346,18 +1379,10 @@ def maybe_start_processing(
             return False
 
 
-        # -------------------------------------
-        # TITULO
-        # -------------------------------------
-
         title = extract_cover_title(
             session["text"]
         )
 
-
-        # -------------------------------------
-        # PRECIO
-        # -------------------------------------
 
         price = (
             session.get(
@@ -1370,10 +1395,18 @@ def maybe_start_processing(
         )
 
 
-        # =====================================
-        # SI NO HAY PRECIO:
-        # NO GENERAR
-        # =====================================
+        phone_number_id = (
+            session.get(
+                "phone_number_id"
+            )
+            or
+            PHONE_NUMBER_ID
+        )
+
+
+        # =================================================
+        # NO HAY PRECIO
+        # =================================================
 
         if not price:
 
@@ -1399,10 +1432,9 @@ def maybe_start_processing(
                         sender,
                         phone_number_id,
                         "⚠️ No detecté el precio.\n\n"
-                        "No voy a generar la portada con un precio inventado.\n\n"
-                        "Envíame SOLO el precio, por ejemplo:\n"
-                        "$349,900\n\n"
-                        "Conservaré tus 10 fotos."
+                        "Tus 10 fotos están guardadas.\n\n"
+                        "Envíame solamente el precio, por ejemplo:\n"
+                        "$349,900"
                     ),
 
                     daemon=True
@@ -1413,12 +1445,9 @@ def maybe_start_processing(
                 "PRECIO NO DETECTADO"
             )
 
+
             return False
 
-
-        # -------------------------------------
-        # SNAPSHOT
-        # -------------------------------------
 
         snapshot = {
             "title":
@@ -1447,10 +1476,6 @@ def maybe_start_processing(
         ] = True
 
 
-    # =========================================
-    # SEGUNDO PLANO
-    # =========================================
-
     thread = threading.Thread(
         target=
             process_moto_background,
@@ -1468,7 +1493,7 @@ def maybe_start_processing(
 
 
     logger.info(
-        "GENERACION DE PORTADA INICIADA EN SEGUNDO PLANO"
+        "GENERACION INICIADA EN SEGUNDO PLANO"
     )
 
 
@@ -1507,16 +1532,14 @@ def process_moto_background(
 
     try:
 
-        # =====================================
-        # SI YA TENEMOS PORTADA,
-        # SOLO REENVIAR
-        # =====================================
-
         with state_lock:
 
-            current_session = pending_motos.get(
-                sender
+            current_session = (
+                pending_motos.get(
+                    sender
+                )
             )
+
 
             existing_cover = (
                 current_session.get(
@@ -1526,6 +1549,10 @@ def process_moto_background(
                 else None
             )
 
+
+        # =================================================
+        # REUTILIZAR SI YA EXISTE
+        # =================================================
 
         if (
             existing_cover
@@ -1537,7 +1564,9 @@ def process_moto_background(
             ).exists()
         ):
 
-            generated_cover = existing_cover
+            generated_cover = (
+                existing_cover
+            )
 
             logger.info(
                 "REUTILIZANDO PORTADA YA GENERADA"
@@ -1557,16 +1586,18 @@ def process_moto_background(
             )
 
 
-        # =====================================
-        # OPENAI FALLO
-        # =====================================
+        # =================================================
+        # ERROR OPENAI
+        # =================================================
 
         if not generated_cover:
 
             with state_lock:
 
-                session = pending_motos.get(
-                    sender
+                session = (
+                    pending_motos.get(
+                        sender
+                    )
                 )
 
                 if session:
@@ -1579,25 +1610,27 @@ def process_moto_background(
             send_whatsapp_text(
                 sender,
                 phone_number_id,
-                "⚠️ No pude generar la portada.\n\n"
-                "Tus 10 fotos siguen guardadas.\n"
-                "Cuando quieras vuelve a enviar:\n"
-                "REINTENTAR"
+                "⚠️ No pude generar la portada.\n"
+                "Tus fotos siguen guardadas.\n\n"
+                "Envía REINTENTAR."
             )
 
 
             return
 
 
-        # =====================================
+        # =================================================
         # GUARDAR PORTADA
-        # =====================================
+        # =================================================
 
         with state_lock:
 
-            session = pending_motos.get(
-                sender
+            session = (
+                pending_motos.get(
+                    sender
+                )
             )
+
 
             if session:
 
@@ -1606,9 +1639,9 @@ def process_moto_background(
                 ] = generated_cover
 
 
-        # =====================================
-        # REGRESAR PORTADA A WHATSAPP
-        # =====================================
+        # =================================================
+        # DEVOLVER POR WHATSAPP
+        # =================================================
 
         sent = send_cover_to_whatsapp(
             recipient=
@@ -1630,9 +1663,9 @@ def process_moto_background(
         )
 
 
-        # =====================================
-        # EXITO
-        # =====================================
+        # =================================================
+        # EXITO TOTAL
+        # =================================================
 
         if sent:
 
@@ -1648,9 +1681,9 @@ def process_moto_background(
                 ] = new_session()
 
 
-        # =====================================
-        # ERROR SOLO EN ENVIO
-        # =====================================
+        # =================================================
+        # ERROR SOLO ENVIO
+        # =================================================
 
         else:
 
@@ -1661,9 +1694,12 @@ def process_moto_background(
 
             with state_lock:
 
-                session = pending_motos.get(
-                    sender
+                session = (
+                    pending_motos.get(
+                        sender
+                    )
                 )
+
 
                 if session:
 
@@ -1676,9 +1712,8 @@ def process_moto_background(
                 sender,
                 phone_number_id,
                 "⚠️ La portada sí se generó, "
-                "pero WhatsApp no pudo recibirla.\n\n"
-                "Envía REINTENTAR y volveré a mandarla "
-                "sin volver a generar la imagen."
+                "pero no pude enviarla.\n\n"
+                "Envía REINTENTAR."
             )
 
 
@@ -1692,9 +1727,12 @@ def process_moto_background(
 
         with state_lock:
 
-            session = pending_motos.get(
-                sender
+            session = (
+                pending_motos.get(
+                    sender
+                )
             )
+
 
             if session:
 
@@ -1727,11 +1765,13 @@ def privacy():
     <html>
     <body style="font-family:Arial;max-width:800px;margin:40px auto;">
         <h1>Política de Privacidad - Superbikers Shop</h1>
+
         <p>
             La información recibida se utiliza
             para atender solicitudes y generar
             contenido relacionado con motocicletas.
         </p>
+
         <p>
             No vendemos información personal.
         </p>
@@ -1741,7 +1781,7 @@ def privacy():
 
 
 # =========================================================
-# VER PORTADA
+# PORTADA PUBLICA
 # =========================================================
 
 @app.get(
@@ -1874,9 +1914,9 @@ def webhook():
                 )
 
 
-                # =====================================
-                # EVITAR DUPLICADOS
-                # =====================================
+                # =================================================
+                # DUPLICADOS
+                # =================================================
 
                 if message_id:
 
@@ -1925,14 +1965,16 @@ def webhook():
                     ] = incoming_phone_number_id
 
 
-                message_type = message.get(
-                    "type"
+                message_type = (
+                    message.get(
+                        "type"
+                    )
                 )
 
 
-                # =====================================
+                # =================================================
                 # IMAGEN
-                # =====================================
+                # =================================================
 
                 if (
                     message_type
@@ -1963,11 +2005,21 @@ def webhook():
                     )
 
 
+                    caption = normalize_text(
+                        image.get(
+                            "caption",
+                            ""
+                        )
+                    )
+
+
                     with state_lock:
 
-                        session = pending_motos[
-                            sender
-                        ]
+                        session = (
+                            pending_motos[
+                                sender
+                            ]
+                        )
 
 
                         if session.get(
@@ -1990,7 +2042,7 @@ def webhook():
                             sender,
                             incoming_phone_number_id,
                             "Ya tengo las 10 fotos.\n"
-                            "Si quieres empezar otra moto envía RESET."
+                            "Si quieres otra moto, envía RESET."
                         )
 
                         continue
@@ -2003,27 +2055,29 @@ def webhook():
                     )
 
 
-                    file_path = download_whatsapp_image(
-                        media_id=
-                            media_id,
+                    file_path = (
+                        download_whatsapp_image(
+                            media_id=
+                                media_id,
 
-                        sender=
-                            sender,
+                            sender=
+                                sender,
 
-                        photo_number=
-                            photo_number,
+                            photo_number=
+                                photo_number,
 
-                        direct_url=
-                            direct_url,
+                            direct_url=
+                                direct_url,
 
-                        mime_type=
-                            mime_type
+                            mime_type=
+                                mime_type
+                        )
                     )
 
 
-                    # =================================
+                    # =================================================
                     # FOTO FALLO
-                    # =================================
+                    # =================================================
 
                     if not file_path:
 
@@ -2031,22 +2085,24 @@ def webhook():
                             sender,
                             incoming_phone_number_id,
                             f"⚠️ No pude descargar la foto {photo_number}.\n\n"
-                            f"Reenvía ESA foto.\n"
-                            f"No la conté dentro de las 10."
+                            f"Reenvía esa foto.\n"
+                            f"No la conté."
                         )
 
                         continue
 
 
-                    # =================================
-                    # SOLO AHORA LA CONTAMOS
-                    # =================================
+                    # =================================================
+                    # REGISTRAR FOTO
+                    # =================================================
 
                     with state_lock:
 
-                        session = pending_motos[
-                            sender
-                        ]
+                        session = (
+                            pending_motos[
+                                sender
+                            ]
+                        )
 
 
                         session[
@@ -2061,7 +2117,21 @@ def webhook():
 
                             "file_path":
                                 file_path
+
                         })
+
+
+                        if (
+                            caption
+                            and
+                            not session[
+                                "text"
+                            ]
+                        ):
+
+                            session[
+                                "text"
+                            ] = caption
 
 
                     logger.info(
@@ -2084,9 +2154,9 @@ def webhook():
                         )
 
 
-                # =====================================
+                # =================================================
                 # TEXTO
-                # =====================================
+                # =================================================
 
                 elif (
                     message_type
@@ -2115,9 +2185,9 @@ def webhook():
                     )
 
 
-                    # ---------------------------------
+                    # =================================================
                     # RESET
-                    # ---------------------------------
+                    # =================================================
 
                     if command == "RESET":
 
@@ -2126,6 +2196,7 @@ def webhook():
                             pending_motos[
                                 sender
                             ] = new_session()
+
 
                             pending_motos[
                                 sender
@@ -2138,23 +2209,26 @@ def webhook():
                             sender,
                             incoming_phone_number_id,
                             "✅ Sesión reiniciada.\n"
-                            "Puedes mandar una moto nueva."
+                            "Puedes mandar otra moto."
                         )
 
                         continue
 
 
-                    # ---------------------------------
+                    # =================================================
                     # REINTENTAR
-                    # ---------------------------------
+                    # =================================================
 
                     if command == "REINTENTAR":
 
                         with state_lock:
 
-                            session = pending_motos.get(
-                                sender
+                            session = (
+                                pending_motos.get(
+                                    sender
+                                )
                             )
+
 
                             if session:
 
@@ -2170,21 +2244,25 @@ def webhook():
                         continue
 
 
-                    detected_price = extract_price(
-                        text
+                    detected_price = (
+                        extract_price(
+                            text
+                        )
                     )
 
 
                     with state_lock:
 
-                        session = pending_motos[
-                            sender
-                        ]
+                        session = (
+                            pending_motos[
+                                sender
+                            ]
+                        )
 
 
-                        # =============================
-                        # ESTABAMOS ESPERANDO PRECIO
-                        # =============================
+                        # =================================================
+                        # ESPERANDO SOLO PRECIO
+                        # =================================================
 
                         if (
                             session.get(
@@ -2198,9 +2276,11 @@ def webhook():
                                 "price_override"
                             ] = detected_price
 
+
                             session[
                                 "waiting_for_price"
                             ] = False
+
 
                             session[
                                 "price_notice_sent"
@@ -2213,9 +2293,9 @@ def webhook():
                             )
 
 
-                        # =============================
+                        # =================================================
                         # MENSAJE SOLO PRECIO
-                        # =============================
+                        # =================================================
 
                         elif (
                             is_price_only_message(
@@ -2232,9 +2312,9 @@ def webhook():
                             ] = detected_price
 
 
-                        # =============================
+                        # =================================================
                         # TEXTO COMPLETO
-                        # =============================
+                        # =================================================
 
                         else:
 
@@ -2255,16 +2335,14 @@ def webhook():
                     )
 
 
-                # =====================================
-                # VER SI YA PODEMOS GENERAR
-                # =====================================
+                # =================================================
+                # INTENTAR GENERAR
+                # =================================================
 
                 maybe_start_processing(
                     sender
                 )
 
-
-    # META RECIBE 200 RAPIDO
 
     return jsonify({
         "success": True

@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import base64
 import hashlib
@@ -11,22 +12,17 @@ from pathlib import Path
 import requests
 from flask import Flask, request, jsonify, send_from_directory
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 # =========================================================
-# APP
+# CONFIGURACION
 # =========================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("superbikers")
-
-
-# =========================================================
-# VARIABLES
-# =========================================================
 
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
@@ -44,6 +40,36 @@ BASE_URL = os.environ.get(
 ).rstrip("/")
 
 
+# =========================================================
+# FACEBOOK / INSTAGRAM
+# =========================================================
+
+FACEBOOK_PAGE_ID = os.environ.get(
+    "FACEBOOK_PAGE_ID",
+    ""
+)
+
+INSTAGRAM_USER_ID = os.environ.get(
+    "INSTAGRAM_USER_ID",
+    ""
+)
+
+META_PAGE_ACCESS_TOKEN = (
+    os.environ.get("META_PAGE_ACCESS_TOKEN", "")
+    or
+    os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN", "")
+)
+
+
+# =========================================================
+# OPENAI
+# =========================================================
+
+OPENAI_IMAGE_MODEL = os.environ.get(
+    "OPENAI_IMAGE_MODEL",
+    "gpt-image-2.5-sunburst"
+)
+
 openai_client = (
     OpenAI(api_key=OPENAI_API_KEY)
     if OPENAI_API_KEY
@@ -52,7 +78,15 @@ openai_client = (
 
 
 # =========================================================
-# ESTADO
+# REGLA DEL SISTEMA
+# =========================================================
+
+ORIGINAL_PHOTO_COUNT = 9
+FINAL_SOCIAL_PHOTO_COUNT = 10
+
+
+# =========================================================
+# ESTADO TEMPORAL
 # =========================================================
 
 pending_motos = {}
@@ -67,10 +101,14 @@ def new_session():
         "text": "",
         "price_override": "",
         "processing": False,
+        "publishing": False,
         "waiting_for_price": False,
         "price_notice_sent": False,
         "phone_number_id": "",
-        "generated_cover": None
+        "generated_cover": None,
+        "ready_to_publish": False,
+        "facebook_post_id": None,
+        "instagram_post_id": None
     }
 
 
@@ -79,12 +117,14 @@ def new_session():
 # =========================================================
 
 def sender_key(sender):
+
     return hashlib.sha256(
         sender.encode("utf-8")
     ).hexdigest()[:18]
 
 
 def sender_folder(sender):
+
     return (
         Path("/tmp/superbikers")
         / sender_key(sender)
@@ -92,6 +132,7 @@ def sender_folder(sender):
 
 
 def normalize_text(text):
+
     if not text:
         return ""
 
@@ -104,6 +145,7 @@ def normalize_text(text):
 
 
 def safe_filename(text):
+
     text = re.sub(
         r"[^a-zA-Z0-9_-]+",
         "_",
@@ -114,7 +156,7 @@ def safe_filename(text):
 
 
 # =========================================================
-# NORMALIZAR NUMERO
+# NUMERO WHATSAPP MEXICO
 # =========================================================
 
 def normalize_whatsapp_recipient(number):
@@ -130,11 +172,8 @@ def normalize_whatsapp_recipient(number):
         and
         len(digits) == 13
     ):
-        digits = (
-            "52"
-            +
-            digits[3:]
-        )
+
+        digits = "52" + digits[3:]
 
     logger.info(
         "DESTINATARIO NORMALIZADO: %s",
@@ -181,9 +220,8 @@ def extract_price(text):
         if line.strip()
     ]
 
+    # Segunda linea
     if len(lines) >= 2:
-
-        second = lines[1]
 
         match = re.search(
             r'(?i)^\s*'
@@ -192,7 +230,7 @@ def extract_price(text):
             r'(\d{2,3}(?:[,\.\s]\d{3})+|\d{5,7})'
             r'\s*(?:mxn|pesos?)?'
             r'\s*$',
-            second
+            lines[1]
         )
 
         if match:
@@ -204,7 +242,7 @@ def extract_price(text):
             if price:
                 return price
 
-
+    # Signo $
     match = re.search(
         r'\$\s*'
         r'(\d{2,3}(?:[,\.\s]\d{3})+|\d{5,7})',
@@ -220,7 +258,7 @@ def extract_price(text):
         if price:
             return price
 
-
+    # Palabra precio
     match = re.search(
         r'(?i)\bprecio\b'
         r'[^\d]{0,20}'
@@ -236,7 +274,6 @@ def extract_price(text):
 
         if price:
             return price
-
 
     return ""
 
@@ -346,7 +383,7 @@ def extract_flags(text):
 
 
 # =========================================================
-# EXTENSION
+# MIME / EXTENSION
 # =========================================================
 
 def get_extension_from_mime(mime_type):
@@ -394,9 +431,11 @@ def send_whatsapp_text(
         or
         not phone_number_id
     ):
+
         logger.error(
-            "Falta token o PHONE_NUMBER_ID"
+            "Falta token WhatsApp o PHONE_NUMBER_ID"
         )
+
         return False
 
 
@@ -409,6 +448,7 @@ def send_whatsapp_text(
     headers = {
         "Authorization":
             f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+
         "Content-Type":
             "application/json"
     }
@@ -451,7 +491,7 @@ def send_whatsapp_text(
     except Exception as error:
 
         logger.exception(
-            "Error enviando texto: %s",
+            "Error enviando texto WhatsApp: %s",
             error
         )
 
@@ -459,7 +499,7 @@ def send_whatsapp_text(
 
 
 # =========================================================
-# SUBIR PORTADA WHATSAPP
+# WHATSAPP MEDIA
 # =========================================================
 
 def upload_media_to_whatsapp(
@@ -529,23 +569,17 @@ def upload_media_to_whatsapp(
 
             return None
 
-        return response.json().get(
-            "id"
-        )
+        return response.json().get("id")
 
     except Exception as error:
 
         logger.exception(
-            "Error subiendo portada: %s",
+            "Error subiendo portada WhatsApp: %s",
             error
         )
 
         return None
 
-
-# =========================================================
-# ENVIAR PORTADA WHATSAPP
-# =========================================================
 
 def send_cover_to_whatsapp(
     recipient,
@@ -573,7 +607,6 @@ def send_cover_to_whatsapp(
     if not media_id:
         return False
 
-
     url = (
         f"https://graph.facebook.com/"
         f"{GRAPH_API_VERSION}/"
@@ -583,6 +616,7 @@ def send_cover_to_whatsapp(
     headers = {
         "Authorization":
             f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+
         "Content-Type":
             "application/json"
     }
@@ -590,8 +624,8 @@ def send_cover_to_whatsapp(
     caption = (
         f"✅ PORTADA LISTA\n"
         f"{title}\n"
-        f"{price}\n"
-        f"Superbikers Shop"
+        f"{price}\n\n"
+        f"Escribe PUBLICAR si está correcta."
     )
 
     payload = {
@@ -645,7 +679,7 @@ def send_cover_to_whatsapp(
 
 
 # =========================================================
-# DESCARGAR FOTO
+# DESCARGAR FOTOS WHATSAPP
 # =========================================================
 
 def try_download_url(
@@ -713,12 +747,14 @@ def download_whatsapp_image(
 
     image_bytes = None
 
+
     if direct_url:
 
         image_bytes = try_download_url(
             direct_url,
             headers
         )
+
 
     if not image_bytes:
 
@@ -743,15 +779,11 @@ def download_whatsapp_image(
                 )
 
                 fallback_url = (
-                    media_info.get(
-                        "url"
-                    )
+                    media_info.get("url")
                 )
 
                 mime_type = (
-                    media_info.get(
-                        "mime_type"
-                    )
+                    media_info.get("mime_type")
                     or
                     mime_type
                 )
@@ -775,6 +807,7 @@ def download_whatsapp_image(
                 "Error consultando media_id: %s",
                 error
             )
+
 
     if not image_bytes:
 
@@ -810,17 +843,117 @@ def download_whatsapp_image(
     )
 
     logger.info(
-        "FOTO %s/10 DESCARGADA CORRECTAMENTE",
-        photo_number
+        "FOTO %s/%s DESCARGADA CORRECTAMENTE",
+        photo_number,
+        ORIGINAL_PHOTO_COUNT
     )
 
-    return str(
-        filepath
-    )
+    return str(filepath)
 
 
 # =========================================================
-# PROMPT
+# HACER PUBLICAS LAS 9 ORIGINALES
+# =========================================================
+
+def prepare_public_originals(
+    sender,
+    photos
+):
+
+    output_folder = (
+        sender_folder(sender)
+        /
+        "generated"
+    )
+
+    output_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    public_id = sender_key(sender)
+
+    result = []
+
+    for index, photo in enumerate(
+        photos,
+        start=1
+    ):
+
+        source_path = Path(
+            photo["file_path"]
+        )
+
+        filename = (
+            f"original_{index:02d}.jpg"
+        )
+
+        output_path = (
+            output_folder
+            /
+            filename
+        )
+
+        try:
+
+            with Image.open(
+                source_path
+            ) as img:
+
+                img = ImageOps.exif_transpose(
+                    img
+                )
+
+                img = img.convert(
+                    "RGB"
+                )
+
+                img.save(
+                    output_path,
+                    "JPEG",
+                    quality=92,
+                    optimize=True
+                )
+
+        except Exception as error:
+
+            logger.exception(
+                "Error preparando original %s: %s",
+                index,
+                error
+            )
+
+            return None
+
+
+        public_url = (
+            f"{BASE_URL}"
+            f"/generated/"
+            f"{public_id}/"
+            f"{filename}"
+        )
+
+        result.append({
+            "number":
+                index,
+
+            "file_path":
+                str(output_path),
+
+            "url":
+                public_url
+        })
+
+
+    logger.info(
+        "9 ORIGINALES PUBLICAS LISTAS ✅"
+    )
+
+    return result
+
+
+# =========================================================
+# PROMPT SUPERBIKERS
 # =========================================================
 
 def build_superbikers_prompt(
@@ -838,8 +971,7 @@ Agregar una etiqueta pequeña con:
 
 "{flags[0]}"
 
-Debe ir integrada cerca del título
-y no competir con la motocicleta.
+Debe ir integrada cerca del título.
 """
 
 
@@ -866,16 +998,16 @@ NO CAMBIAR:
 - piezas
 - proporciones
 
-SOLO MEJORAR:
+MEJORAR SOLAMENTE:
 
-- iluminacion
+- iluminación
 - contraste
 - nitidez
 - profundidad
 - sombras suaves
 
-DEBE SEGUIR PARECIENDO
-UNA FOTOGRAFIA REAL.
+LA MOTOCICLETA DEBE SEGUIR
+PARECIENDO LA FOTO ORIGINAL.
 
 
 TITULO GRANDE ARRIBA:
@@ -883,12 +1015,20 @@ TITULO GRANDE ARRIBA:
 "{title}"
 
 
-PRECIO:
+El título debe ser:
+
+- grande
+- brush
+- graffiti automotriz
+- deportivo
+- premium
+- muy legible
+
+
+PRECIO EXACTO:
 
 "{price}"
 
-
-REGLA MUY IMPORTANTE:
 
 NO CAMBIAR EL PRECIO.
 
@@ -899,59 +1039,50 @@ NO ESCRIBIR:
 - PREGUNTA PRECIO
 
 
-El precio debe ir:
+PRECIO:
 
 CENTRADO
-DEBAJO DE LA MOTOCICLETA
+ABAJO DE LA MOTOCICLETA
 
-En un recuadro pequeño,
-compacto y deportivo.
+EN UN RECUADRO PEQUEÑO,
+COMPACTO Y DEPORTIVO.
 
 
 SUPERBIKERS SHOP:
 
-Hasta abajo.
+HASTA ABAJO.
 
-Pequeño.
+PEQUEÑO.
 
-Tipografía:
-
-- brush
-- graffiti
-- exótica
-- automotriz
+TIPOGRAFIA BRUSH,
+GRAFFITI Y AUTOMOTRIZ.
 
 
 {flag_instruction}
 
 
-ORDEN:
+ORDEN VISUAL:
 
-TITULO GRANDE ARRIBA
-
-MOTOCICLETA
-
-PRECIO PEQUEÑO ABAJO DE LA MOTO
-
-SUPERBIKERS SHOP HASTA ABAJO
+1. TITULO GRANDE ARRIBA
+2. MOTOCICLETA
+3. PRECIO PEQUEÑO ABAJO
+4. SUPERBIKERS SHOP
 
 
 NO AGREGAR:
 
 - teléfonos
 - direcciones
-- hashtags
 - vendedores
-- millas
-- factura
-- pedimento
-- condiciones
+- hashtags
+- facturas
+- pedimentos
 - marcas de agua nuevas
 """.strip()
 
 
 # =========================================================
-# OPENAI + PNG + JPG INSTAGRAM
+# OPENAI PORTADA
 # =========================================================
 
 def create_cover_with_openai(
@@ -974,13 +1105,11 @@ def create_cover_with_openai(
     if (
         not cover_path
         or
-        not Path(
-            cover_path
-        ).exists()
+        not Path(cover_path).exists()
     ):
 
         logger.error(
-            "No existe foto de portada"
+            "No existe foto base"
         )
 
         return None
@@ -1020,7 +1149,7 @@ def create_cover_with_openai(
                 .images
                 .edit(
                     model=
-                        "gpt-image-2.5-sunburst",
+                        OPENAI_IMAGE_MODEL,
 
                     image=
                         image_file,
@@ -1059,26 +1188,13 @@ def create_cover_with_openai(
         return None
 
 
-    try:
-
-        image_bytes = base64.b64decode(
-            result.data[0].b64_json
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Error decodificando portada: %s",
-            error
-        )
-
-        return None
+    image_bytes = base64.b64decode(
+        result.data[0].b64_json
+    )
 
 
     output_folder = (
-        sender_folder(
-            sender
-        )
+        sender_folder(sender)
         /
         "generated"
     )
@@ -1089,16 +1205,14 @@ def create_cover_with_openai(
     )
 
 
-    # =====================================================
-    # PNG
-    # =====================================================
+    base_name = safe_filename(
+        title
+    )
 
+
+    # PNG WhatsApp
     png_filename = (
-        safe_filename(
-            title
-        )
-        +
-        "_openai.png"
+        f"{base_name}_openai.png"
     )
 
     png_path = (
@@ -1112,22 +1226,15 @@ def create_cover_with_openai(
     )
 
 
-    # =====================================================
-    # JPG REAL PARA INSTAGRAM
-    # =====================================================
-
-    instagram_filename = (
-        safe_filename(
-            title
-        )
-        +
-        "_instagram.jpg"
+    # JPG redes
+    jpg_filename = (
+        f"{base_name}_instagram.jpg"
     )
 
-    instagram_path = (
+    jpg_path = (
         output_folder
         /
-        instagram_filename
+        jpg_filename
     )
 
 
@@ -1137,25 +1244,25 @@ def create_cover_with_openai(
             png_path
         ) as img:
 
+            img = ImageOps.exif_transpose(
+                img
+            )
+
             img = img.convert(
                 "RGB"
             )
 
             img.save(
-                instagram_path,
+                jpg_path,
                 "JPEG",
                 quality=95,
                 optimize=True
             )
 
-        logger.info(
-            "JPG INSTAGRAM CREADO ✅"
-        )
-
     except Exception as error:
 
         logger.exception(
-            "ERROR CREANDO JPG INSTAGRAM: %s",
+            "ERROR CREANDO JPG: %s",
             error
         )
 
@@ -1175,11 +1282,11 @@ def create_cover_with_openai(
     )
 
 
-    instagram_url = (
+    jpg_url = (
         f"{BASE_URL}"
         f"/generated/"
         f"{public_id}/"
-        f"{instagram_filename}"
+        f"{jpg_filename}"
     )
 
 
@@ -1193,8 +1300,8 @@ def create_cover_with_openai(
     )
 
     logger.info(
-        "INSTAGRAM JPG URL: %s",
-        instagram_url
+        "JPG REDES URL: %s",
+        jpg_url
     )
 
 
@@ -1205,22 +1312,463 @@ def create_cover_with_openai(
         "url":
             png_url,
 
-        "filename":
-            png_filename,
+        "social_file_path":
+            str(jpg_path),
 
-        "instagram_file_path":
-            str(instagram_path),
+        "social_url":
+            jpg_url,
 
-        "instagram_url":
-            instagram_url,
-
-        "instagram_filename":
-            instagram_filename
+        "public_originals":
+            []
     }
 
 
 # =========================================================
-# PROCESAR
+# FACEBOOK — 10 FOTOS EN UN SOLO POST
+# =========================================================
+
+def publish_facebook_carousel(
+    image_urls,
+    message
+):
+
+    if not (
+        FACEBOOK_PAGE_ID
+        and
+        META_PAGE_ACCESS_TOKEN
+    ):
+
+        raise RuntimeError(
+            "Faltan variables de Facebook"
+        )
+
+
+    if len(image_urls) != FINAL_SOCIAL_PHOTO_COUNT:
+
+        raise RuntimeError(
+            f"Facebook esperaba 10 fotos y recibió {len(image_urls)}"
+        )
+
+
+    photo_ids = []
+
+
+    # Primero cargar las 10 fotos SIN publicar
+    for index, image_url in enumerate(
+        image_urls,
+        start=1
+    ):
+
+        endpoint = (
+            f"https://graph.facebook.com/"
+            f"{GRAPH_API_VERSION}/"
+            f"{FACEBOOK_PAGE_ID}/photos"
+        )
+
+        data = {
+            "url":
+                image_url,
+
+            "published":
+                "false",
+
+            "access_token":
+                META_PAGE_ACCESS_TOKEN
+        }
+
+
+        response = requests.post(
+            endpoint,
+            data=data,
+            timeout=120
+        )
+
+
+        logger.info(
+            "FB FOTO %s/10 STATUS: %s",
+            index,
+            response.status_code
+        )
+
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                f"Facebook foto {index}: "
+                f"{response.text[:800]}"
+            )
+
+
+        photo_id = (
+            response.json().get("id")
+        )
+
+
+        if not photo_id:
+
+            raise RuntimeError(
+                f"Facebook no devolvió ID para foto {index}"
+            )
+
+
+        photo_ids.append(
+            photo_id
+        )
+
+
+    # Crear un SOLO post con las 10
+    feed_endpoint = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{FACEBOOK_PAGE_ID}/feed"
+    )
+
+
+    data = {
+        "message":
+            message,
+
+        "access_token":
+            META_PAGE_ACCESS_TOKEN
+    }
+
+
+    for index, photo_id in enumerate(
+        photo_ids
+    ):
+
+        data[
+            f"attached_media[{index}]"
+        ] = json.dumps({
+            "media_fbid":
+                photo_id
+        })
+
+
+    response = requests.post(
+        feed_endpoint,
+        data=data,
+        timeout=120
+    )
+
+
+    logger.info(
+        "FACEBOOK POST STATUS: %s",
+        response.status_code
+    )
+
+
+    if response.status_code >= 400:
+
+        raise RuntimeError(
+            f"Facebook post: "
+            f"{response.text[:1000]}"
+        )
+
+
+    post_id = (
+        response.json().get("id")
+    )
+
+
+    logger.info(
+        "FACEBOOK PUBLICADO ✅ %s",
+        post_id
+    )
+
+
+    return post_id
+
+
+# =========================================================
+# INSTAGRAM STATUS
+# =========================================================
+
+def wait_instagram_container(
+    container_id,
+    timeout_seconds=60
+):
+
+    endpoint = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{container_id}"
+    )
+
+
+    deadline = (
+        time.time()
+        +
+        timeout_seconds
+    )
+
+
+    while time.time() < deadline:
+
+        response = requests.get(
+            endpoint,
+            params={
+                "fields":
+                    "status_code,status",
+
+                "access_token":
+                    META_PAGE_ACCESS_TOKEN
+            },
+            timeout=30
+        )
+
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                f"Instagram status: "
+                f"{response.text[:800]}"
+            )
+
+
+        payload = response.json()
+
+        status_code = payload.get(
+            "status_code"
+        )
+
+
+        logger.info(
+            "IG CONTAINER %s: %s",
+            container_id,
+            status_code
+        )
+
+
+        if status_code in (
+            "FINISHED",
+            "PUBLISHED"
+        ):
+
+            return True
+
+
+        if status_code in (
+            "ERROR",
+            "EXPIRED"
+        ):
+
+            raise RuntimeError(
+                f"Instagram container error: "
+                f"{payload}"
+            )
+
+
+        time.sleep(2)
+
+
+    raise RuntimeError(
+        "Instagram tardó demasiado procesando el contenido"
+    )
+
+
+# =========================================================
+# INSTAGRAM — CARRUSEL DE 10
+# =========================================================
+
+def publish_instagram_carousel(
+    image_urls,
+    caption
+):
+
+    if not (
+        INSTAGRAM_USER_ID
+        and
+        META_PAGE_ACCESS_TOKEN
+    ):
+
+        raise RuntimeError(
+            "Faltan variables de Instagram"
+        )
+
+
+    if len(image_urls) != FINAL_SOCIAL_PHOTO_COUNT:
+
+        raise RuntimeError(
+            f"Instagram esperaba 10 fotos y recibió {len(image_urls)}"
+        )
+
+
+    child_ids = []
+
+
+    # Crear 10 hijos
+    for index, image_url in enumerate(
+        image_urls,
+        start=1
+    ):
+
+        endpoint = (
+            f"https://graph.facebook.com/"
+            f"{GRAPH_API_VERSION}/"
+            f"{INSTAGRAM_USER_ID}/media"
+        )
+
+
+        response = requests.post(
+            endpoint,
+            data={
+                "image_url":
+                    image_url,
+
+                "is_carousel_item":
+                    "true",
+
+                "access_token":
+                    META_PAGE_ACCESS_TOKEN
+            },
+            timeout=120
+        )
+
+
+        logger.info(
+            "IG ITEM %s/10 STATUS: %s",
+            index,
+            response.status_code
+        )
+
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                f"Instagram foto {index}: "
+                f"{response.text[:1000]}"
+            )
+
+
+        container_id = (
+            response.json().get("id")
+        )
+
+
+        if not container_id:
+
+            raise RuntimeError(
+                f"Instagram no devolvió ID para foto {index}"
+            )
+
+
+        child_ids.append(
+            container_id
+        )
+
+
+    # Crear contenedor padre
+    parent_endpoint = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{INSTAGRAM_USER_ID}/media"
+    )
+
+
+    parent_response = requests.post(
+        parent_endpoint,
+        data={
+            "media_type":
+                "CAROUSEL",
+
+            "children":
+                ",".join(child_ids),
+
+            "caption":
+                caption,
+
+            "access_token":
+                META_PAGE_ACCESS_TOKEN
+        },
+        timeout=120
+    )
+
+
+    logger.info(
+        "IG CAROUSEL STATUS: %s",
+        parent_response.status_code
+    )
+
+
+    if parent_response.status_code >= 400:
+
+        raise RuntimeError(
+            f"Instagram carrusel: "
+            f"{parent_response.text[:1000]}"
+        )
+
+
+    carousel_id = (
+        parent_response.json().get("id")
+    )
+
+
+    if not carousel_id:
+
+        raise RuntimeError(
+            "Instagram no devolvió ID del carrusel"
+        )
+
+
+    # Esperar a que Meta termine de procesarlo
+    wait_instagram_container(
+        carousel_id,
+        timeout_seconds=90
+    )
+
+
+    # Publicar
+    publish_endpoint = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{INSTAGRAM_USER_ID}/media_publish"
+    )
+
+
+    publish_response = requests.post(
+        publish_endpoint,
+        data={
+            "creation_id":
+                carousel_id,
+
+            "access_token":
+                META_PAGE_ACCESS_TOKEN
+        },
+        timeout=120
+    )
+
+
+    logger.info(
+        "IG PUBLISH STATUS: %s",
+        publish_response.status_code
+    )
+
+
+    if publish_response.status_code >= 400:
+
+        raise RuntimeError(
+            f"Instagram publicación: "
+            f"{publish_response.text[:1000]}"
+        )
+
+
+    media_id = (
+        publish_response.json().get("id")
+    )
+
+
+    logger.info(
+        "INSTAGRAM PUBLICADO ✅ %s",
+        media_id
+    )
+
+
+    return media_id
+
+
+# =========================================================
+# GENERAR PORTADA
 # =========================================================
 
 def maybe_start_processing(
@@ -1233,25 +1781,28 @@ def maybe_start_processing(
             sender
         )
 
+
         if not session:
             return False
 
-        if session.get(
-            "processing"
-        ):
+
+        if session.get("processing"):
             return False
+
+
+        if session.get("ready_to_publish"):
+            return False
+
 
         if (
-            len(
-                session["photos"]
-            )
-            != 10
+            len(session["photos"])
+            != ORIGINAL_PHOTO_COUNT
         ):
+
             return False
 
-        if not session[
-            "text"
-        ]:
+
+        if not session["text"]:
             return False
 
 
@@ -1261,9 +1812,7 @@ def maybe_start_processing(
 
 
         price = (
-            session.get(
-                "price_override"
-            )
+            session.get("price_override")
             or
             extract_price(
                 session["text"]
@@ -1272,9 +1821,7 @@ def maybe_start_processing(
 
 
         phone_number_id = (
-            session.get(
-                "phone_number_id"
-            )
+            session.get("phone_number_id")
             or
             PHONE_NUMBER_ID
         )
@@ -1295,6 +1842,7 @@ def maybe_start_processing(
                     "price_notice_sent"
                 ] = True
 
+
                 threading.Thread(
                     target=
                         send_whatsapp_text,
@@ -1303,9 +1851,9 @@ def maybe_start_processing(
                         sender,
                         phone_number_id,
                         "⚠️ No detecté el precio.\n\n"
-                        "Tus 10 fotos están guardadas.\n\n"
-                        "Envíame solamente el precio, por ejemplo:\n"
-                        "$349,900"
+                        "Tus 9 fotos están guardadas.\n\n"
+                        "Envíame solamente el precio.\n"
+                        "Ejemplo: $349,900"
                     ),
 
                     daemon=True
@@ -1337,7 +1885,12 @@ def maybe_start_processing(
                 ],
 
             "phone_number_id":
-                phone_number_id
+                phone_number_id,
+
+            "photos":
+                list(
+                    session["photos"]
+                )
         }
 
 
@@ -1346,7 +1899,7 @@ def maybe_start_processing(
         ] = True
 
 
-    thread = threading.Thread(
+    threading.Thread(
         target=
             process_moto_background,
 
@@ -1356,19 +1909,19 @@ def maybe_start_processing(
         ),
 
         daemon=True
-    )
+    ).start()
 
-    thread.start()
 
     logger.info(
         "GENERACION INICIADA EN SEGUNDO PLANO"
     )
 
+
     return True
 
 
 # =========================================================
-# BACKGROUND
+# PROCESAR PORTADA BACKGROUND
 # =========================================================
 
 def process_moto_background(
@@ -1376,203 +1929,113 @@ def process_moto_background(
     snapshot
 ):
 
-    title = snapshot[
-        "title"
-    ]
-
-    price = snapshot[
-        "price"
-    ]
-
-    flags = snapshot[
-        "flags"
-    ]
-
-    cover_path = snapshot[
-        "cover_path"
-    ]
-
-    phone_number_id = snapshot[
-        "phone_number_id"
-    ]
-
-
     try:
 
-        with state_lock:
+        title = snapshot["title"]
+        price = snapshot["price"]
+        flags = snapshot["flags"]
+        cover_path = snapshot["cover_path"]
+        phone_number_id = snapshot["phone_number_id"]
+        photos = snapshot["photos"]
 
-            current_session = (
-                pending_motos.get(
-                    sender
-                )
+
+        generated_cover = (
+            create_cover_with_openai(
+                sender,
+                title,
+                price,
+                flags,
+                cover_path
             )
-
-            existing_cover = (
-                current_session.get(
-                    "generated_cover"
-                )
-                if current_session
-                else None
-            )
-
-
-        if (
-            existing_cover
-            and
-            Path(
-                existing_cover[
-                    "file_path"
-                ]
-            ).exists()
-        ):
-
-            generated_cover = (
-                existing_cover
-            )
-
-            logger.info(
-                "REUTILIZANDO PORTADA YA GENERADA"
-            )
-
-        else:
-
-            generated_cover = (
-                create_cover_with_openai(
-                    sender,
-                    title,
-                    price,
-                    flags,
-                    cover_path
-                )
-            )
+        )
 
 
         if not generated_cover:
 
-            with state_lock:
-
-                session = (
-                    pending_motos.get(
-                        sender
-                    )
-                )
-
-                if session:
-
-                    session[
-                        "processing"
-                    ] = False
-
-
-            send_whatsapp_text(
-                sender,
-                phone_number_id,
-                "⚠️ No pude generar la portada.\n"
-                "Tus fotos siguen guardadas.\n\n"
-                "Envía REINTENTAR."
+            raise RuntimeError(
+                "No se pudo generar portada"
             )
 
-            return
+
+        public_originals = (
+            prepare_public_originals(
+                sender,
+                photos
+            )
+        )
+
+
+        if not public_originals:
+
+            raise RuntimeError(
+                "No se pudieron preparar originales"
+            )
+
+
+        generated_cover[
+            "public_originals"
+        ] = public_originals
 
 
         with state_lock:
 
-            session = (
-                pending_motos.get(
-                    sender
-                )
+            session = pending_motos.get(
+                sender
             )
 
-            if session:
+            if not session:
+                return
 
-                session[
-                    "generated_cover"
-                ] = generated_cover
+            session[
+                "generated_cover"
+            ] = generated_cover
+
+            session[
+                "processing"
+            ] = False
+
+            session[
+                "ready_to_publish"
+            ] = True
 
 
         sent = send_cover_to_whatsapp(
-            recipient=
-                sender,
-
-            phone_number_id=
-                phone_number_id,
-
-            file_path=
-                generated_cover[
-                    "file_path"
-                ],
-
-            title=
-                title,
-
-            price=
-                price
+            sender,
+            phone_number_id,
+            generated_cover[
+                "file_path"
+            ],
+            title,
+            price
         )
 
 
         if sent:
 
             logger.info(
-                "PORTADA GENERADA Y DEVUELTA A WHATSAPP ✅"
+                "PORTADA LISTA PARA APROBACION ✅"
             )
-
-            logger.info(
-                "URL INSTAGRAM LISTA: %s",
-                generated_cover[
-                    "instagram_url"
-                ]
-            )
-
-            with state_lock:
-
-                pending_motos[
-                    sender
-                ] = new_session()
 
 
         else:
 
             logger.error(
-                "PORTADA GENERADA PERO NO SE PUDO ENVIAR"
-            )
-
-            with state_lock:
-
-                session = (
-                    pending_motos.get(
-                        sender
-                    )
-                )
-
-                if session:
-
-                    session[
-                        "processing"
-                    ] = False
-
-
-            send_whatsapp_text(
-                sender,
-                phone_number_id,
-                "⚠️ La portada sí se generó, "
-                "pero no pude enviarla.\n\n"
-                "Envía REINTENTAR."
+                "Portada creada pero no enviada por WhatsApp"
             )
 
 
     except Exception as error:
 
         logger.exception(
-            "Error inesperado: %s",
+            "ERROR PROCESANDO MOTO: %s",
             error
         )
 
+
         with state_lock:
 
-            session = (
-                pending_motos.get(
-                    sender
-                )
+            session = pending_motos.get(
+                sender
             )
 
             if session:
@@ -1580,6 +2043,288 @@ def process_moto_background(
                 session[
                     "processing"
                 ] = False
+
+
+        send_whatsapp_text(
+            sender,
+            snapshot.get(
+                "phone_number_id",
+                PHONE_NUMBER_ID
+            ),
+            "⚠️ Hubo un error generando la portada.\n"
+            "Envía REINTENTAR."
+        )
+
+
+# =========================================================
+# PUBLICAR BACKGROUND
+# =========================================================
+
+def publish_background(
+    sender
+):
+
+    with state_lock:
+
+        session = pending_motos.get(
+            sender
+        )
+
+        if not session:
+            return
+
+        phone_number_id = (
+            session.get("phone_number_id")
+            or
+            PHONE_NUMBER_ID
+        )
+
+        text = session.get(
+            "text",
+            ""
+        )
+
+        generated_cover = session.get(
+            "generated_cover"
+        )
+
+        facebook_existing = session.get(
+            "facebook_post_id"
+        )
+
+        instagram_existing = session.get(
+            "instagram_post_id"
+        )
+
+
+    try:
+
+        if not generated_cover:
+
+            raise RuntimeError(
+                "No existe portada generada"
+            )
+
+
+        originals = (
+            generated_cover.get(
+                "public_originals",
+                []
+            )
+        )
+
+
+        if len(originals) != ORIGINAL_PHOTO_COUNT:
+
+            raise RuntimeError(
+                "No están disponibles las 9 originales"
+            )
+
+
+        # ORDEN FINAL:
+        # 1 PORTADA + 9 ORIGINALES
+
+        image_urls = [
+            generated_cover[
+                "social_url"
+            ]
+        ]
+
+        image_urls.extend(
+            item["url"]
+            for item in originals
+        )
+
+
+        logger.info(
+            "TOTAL IMAGENES PARA REDES: %s",
+            len(image_urls)
+        )
+
+
+        if len(image_urls) != 10:
+
+            raise RuntimeError(
+                "La publicación no contiene exactamente 10 imágenes"
+            )
+
+
+        facebook_id = (
+            facebook_existing
+        )
+
+        instagram_id = (
+            instagram_existing
+        )
+
+
+        # Facebook
+        if not facebook_id:
+
+            facebook_id = (
+                publish_facebook_carousel(
+                    image_urls,
+                    text
+                )
+            )
+
+            with state_lock:
+
+                if sender in pending_motos:
+
+                    pending_motos[
+                        sender
+                    ][
+                        "facebook_post_id"
+                    ] = facebook_id
+
+
+        # Instagram
+        if not instagram_id:
+
+            instagram_id = (
+                publish_instagram_carousel(
+                    image_urls,
+                    text
+                )
+            )
+
+            with state_lock:
+
+                if sender in pending_motos:
+
+                    pending_motos[
+                        sender
+                    ][
+                        "instagram_post_id"
+                    ] = instagram_id
+
+
+        send_whatsapp_text(
+            sender,
+            phone_number_id,
+            "✅ PUBLICACIÓN COMPLETADA\n\n"
+            "Facebook ✅\n"
+            "Instagram ✅\n\n"
+            "10 imágenes publicadas:\n"
+            "1 portada + 9 originales."
+        )
+
+
+        logger.info(
+            "PUBLICACION COMPLETA FB + IG ✅"
+        )
+
+
+        # Ya puede entrar otra moto
+        with state_lock:
+
+            pending_motos[
+                sender
+            ] = new_session()
+
+            pending_motos[
+                sender
+            ][
+                "phone_number_id"
+            ] = phone_number_id
+
+
+    except Exception as error:
+
+        logger.exception(
+            "ERROR PUBLICANDO: %s",
+            error
+        )
+
+
+        with state_lock:
+
+            session = pending_motos.get(
+                sender
+            )
+
+            if session:
+
+                session[
+                    "publishing"
+                ] = False
+
+
+        send_whatsapp_text(
+            sender,
+            phone_number_id,
+            "⚠️ Hubo un error publicando.\n\n"
+            "La moto quedó guardada.\n"
+            "Puedes volver a enviar PUBLICAR.\n\n"
+            "Revisa Render → Logs para ver el detalle."
+        )
+
+
+# =========================================================
+# INICIAR PUBLICACION
+# =========================================================
+
+def start_publish(
+    sender
+):
+
+    with state_lock:
+
+        session = pending_motos.get(
+            sender
+        )
+
+
+        if not session:
+
+            return (
+                False,
+                "No hay una moto lista."
+            )
+
+
+        if not session.get(
+            "ready_to_publish"
+        ):
+
+            return (
+                False,
+                "Todavía no hay una portada lista para publicar."
+            )
+
+
+        if session.get(
+            "publishing"
+        ):
+
+            return (
+                False,
+                "La publicación ya está en proceso."
+            )
+
+
+        session[
+            "publishing"
+        ] = True
+
+
+    threading.Thread(
+        target=
+            publish_background,
+
+        args=(
+            sender,
+        ),
+
+        daemon=True
+    ).start()
+
+
+    return (
+        True,
+        "Publicando..."
+    )
 
 
 # =========================================================
@@ -1591,7 +2336,9 @@ def home():
 
     return jsonify({
         "status": "ok",
-        "service": "Superbikers Automatizacion"
+        "service": "Superbikers Automatizacion",
+        "original_photos": 9,
+        "social_photos": 10
     }), 200
 
 
@@ -1607,20 +2354,18 @@ def privacy():
     <body style="font-family:Arial;max-width:800px;margin:40px auto;">
         <h1>Política de Privacidad - Superbikers Shop</h1>
         <p>
-            La información recibida se utiliza
-            para atender solicitudes y generar
-            contenido relacionado con motocicletas.
+            La información recibida se utiliza para
+            generar y publicar contenido relacionado
+            con motocicletas.
         </p>
-        <p>
-            No vendemos información personal.
-        </p>
+        <p>No vendemos información personal.</p>
     </body>
     </html>
     """, 200
 
 
 # =========================================================
-# ARCHIVOS GENERADOS
+# ARCHIVOS PUBLICOS
 # =========================================================
 
 @app.get(
@@ -1646,7 +2391,7 @@ def generated(
 
 
 # =========================================================
-# META VERIFY
+# WEBHOOK VERIFY
 # =========================================================
 
 @app.get("/webhook/whatsapp")
@@ -1678,7 +2423,7 @@ def verify_webhook():
 
 
 # =========================================================
-# WEBHOOK
+# WEBHOOK WHATSAPP
 # =========================================================
 
 @app.post("/webhook/whatsapp")
@@ -1690,6 +2435,7 @@ def webhook():
         )
         or {}
     )
+
 
     logger.info(
         "WEBHOOK RECIBIDO"
@@ -1751,6 +2497,7 @@ def webhook():
                             message_id
                             in seen_message_ids
                         ):
+
                             continue
 
 
@@ -1759,12 +2506,9 @@ def webhook():
                         )
 
 
-                        if (
-                            len(
-                                seen_message_ids
-                            )
-                            > 5000
-                        ):
+                        if len(
+                            seen_message_ids
+                        ) > 5000:
 
                             seen_message_ids.clear()
 
@@ -1799,11 +2543,7 @@ def webhook():
                 # IMAGEN
                 # =================================================
 
-                if (
-                    message_type
-                    ==
-                    "image"
-                ):
+                if message_type == "image":
 
                     image = message.get(
                         "image",
@@ -1833,31 +2573,34 @@ def webhook():
 
                     with state_lock:
 
-                        session = (
-                            pending_motos[
-                                sender
-                            ]
-                        )
+                        session = pending_motos[
+                            sender
+                        ]
 
-                        if session.get(
-                            "processing"
+                        if (
+                            session.get(
+                                "processing"
+                            )
+                            or
+                            session.get(
+                                "ready_to_publish"
+                            )
                         ):
+
                             continue
 
                         current_count = len(
-                            session[
-                                "photos"
-                            ]
+                            session["photos"]
                         )
 
 
-                    if current_count >= 10:
+                    if current_count >= ORIGINAL_PHOTO_COUNT:
 
                         send_whatsapp_text(
                             sender,
                             incoming_phone_number_id,
-                            "Ya tengo las 10 fotos.\n"
-                            "Si quieres otra moto, envía RESET."
+                            "Ya tengo las 9 fotos.\n"
+                            "Espera la portada."
                         )
 
                         continue
@@ -1895,9 +2638,8 @@ def webhook():
                         send_whatsapp_text(
                             sender,
                             incoming_phone_number_id,
-                            f"⚠️ No pude descargar la foto {photo_number}.\n\n"
-                            f"Reenvía esa foto.\n"
-                            f"No la conté."
+                            f"⚠️ No pude descargar la foto {photo_number}.\n"
+                            f"Reenvía esa foto."
                         )
 
                         continue
@@ -1905,16 +2647,13 @@ def webhook():
 
                     with state_lock:
 
-                        session = (
-                            pending_motos[
-                                sender
-                            ]
-                        )
+                        session = pending_motos[
+                            sender
+                        ]
 
                         session[
                             "photos"
                         ].append({
-
                             "number":
                                 photo_number,
 
@@ -1923,16 +2662,13 @@ def webhook():
 
                             "file_path":
                                 file_path
-
                         })
 
 
                         if (
                             caption
                             and
-                            not session[
-                                "text"
-                            ]
+                            not session["text"]
                         ):
 
                             session[
@@ -1941,7 +2677,7 @@ def webhook():
 
 
                     logger.info(
-                        "FOTO %s/10 REGISTRADA",
+                        "FOTO %s/9 REGISTRADA",
                         photo_number
                     )
 
@@ -1949,14 +2685,14 @@ def webhook():
                     if photo_number == 1:
 
                         logger.info(
-                            "FOTO #1 = PORTADA"
+                            "FOTO #1 = BASE DE PORTADA"
                         )
 
 
-                    if photo_number == 10:
+                    if photo_number == 9:
 
                         logger.info(
-                            "10 FOTOS COMPLETAS"
+                            "9 FOTOS COMPLETAS"
                         )
 
 
@@ -1964,14 +2700,9 @@ def webhook():
                 # TEXTO
                 # =================================================
 
-                elif (
-                    message_type
-                    ==
-                    "text"
-                ):
+                elif message_type == "text":
 
                     text = normalize_text(
-
                         message.get(
                             "text",
                             {}
@@ -1981,14 +2712,12 @@ def webhook():
                         )
                     )
 
-
                     command = (
-                        text
-                        .strip()
-                        .upper()
+                        text.strip().upper()
                     )
 
 
+                    # RESET
                     if command == "RESET":
 
                         with state_lock:
@@ -2008,26 +2737,50 @@ def webhook():
                             sender,
                             incoming_phone_number_id,
                             "✅ Sesión reiniciada.\n"
-                            "Puedes mandar otra moto."
+                            "Manda las 9 fotos de la siguiente moto."
                         )
 
                         continue
 
 
+                    # PUBLICAR
+                    if command == "PUBLICAR":
+
+                        ok, status = start_publish(
+                            sender
+                        )
+
+                        send_whatsapp_text(
+                            sender,
+                            incoming_phone_number_id,
+                            (
+                                "🚀 Publicando en Facebook e Instagram..."
+                                if ok
+                                else
+                                f"⚠️ {status}"
+                            )
+                        )
+
+                        continue
+
+
+                    # REINTENTAR PORTADA
                     if command == "REINTENTAR":
 
                         with state_lock:
 
-                            session = (
-                                pending_motos.get(
-                                    sender
-                                )
+                            session = pending_motos.get(
+                                sender
                             )
 
                             if session:
 
                                 session[
                                     "processing"
+                                ] = False
+
+                                session[
+                                    "ready_to_publish"
                                 ] = False
 
 
@@ -2038,20 +2791,39 @@ def webhook():
                         continue
 
 
-                    detected_price = (
-                        extract_price(
-                            text
-                        )
+                    with state_lock:
+
+                        session = pending_motos[
+                            sender
+                        ]
+
+
+                        # Si ya hay portada lista no alterar información
+                        if session.get(
+                            "ready_to_publish"
+                        ):
+
+                            send_whatsapp_text(
+                                sender,
+                                incoming_phone_number_id,
+                                "La portada ya está lista.\n\n"
+                                "Escribe PUBLICAR para subirla\n"
+                                "o RESET para cancelar."
+                            )
+
+                            continue
+
+
+                    detected_price = extract_price(
+                        text
                     )
 
 
                     with state_lock:
 
-                        session = (
-                            pending_motos[
-                                sender
-                            ]
-                        )
+                        session = pending_motos[
+                            sender
+                        ]
 
 
                         if (
@@ -2074,7 +2846,6 @@ def webhook():
                                 "price_notice_sent"
                             ] = False
 
-
                             logger.info(
                                 "PRECIO RECIBIDO: %s",
                                 detected_price
@@ -2086,9 +2857,7 @@ def webhook():
                                 text
                             )
                             and
-                            session.get(
-                                "text"
-                            )
+                            session.get("text")
                         ):
 
                             session[
@@ -2102,7 +2871,6 @@ def webhook():
                                 "text"
                             ] = text
 
-
                             if detected_price:
 
                                 session[
@@ -2114,6 +2882,10 @@ def webhook():
                         "TEXTO RECIBIDO"
                     )
 
+
+                # =================================================
+                # INTENTAR GENERAR
+                # =================================================
 
                 maybe_start_processing(
                     sender

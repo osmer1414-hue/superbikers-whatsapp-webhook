@@ -206,7 +206,38 @@ def receive_webhook():
         "messages": processed_messages
     }), 200
 
+@app.get("/privacy")
+def privacy():
+    return """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <title>Política de Privacidad - Superbikers Shop</title>
+    </head>
+    <body style="font-family:Arial;max-width:800px;margin:40px auto;line-height:1.6;">
+        <h1>Política de Privacidad de Superbikers Shop</h1>
 
+        <p>En Superbikers Shop respetamos la privacidad de nuestros clientes y usuarios.</p>
+
+        <p>La información recibida a través de WhatsApp, Facebook, Instagram
+        y nuestros canales digitales se utiliza para atender solicitudes,
+        proporcionar información sobre motocicletas, responder consultas
+        y gestionar publicaciones relacionadas con nuestros servicios.</p>
+
+        <p>No vendemos ni comercializamos información personal de nuestros usuarios.</p>
+
+        <p>La información puede ser procesada mediante herramientas tecnológicas
+        utilizadas por Superbikers Shop para administrar mensajes,
+        inventario y publicaciones en redes sociales.</p>
+
+        <p>Los usuarios pueden solicitar información, corrección o eliminación
+        de sus datos comunicándose directamente con Superbikers Shop.</p>
+
+        <p>Última actualización: septiembre de 2026.</p>
+    </body>
+    </html>
+    """, 200
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)

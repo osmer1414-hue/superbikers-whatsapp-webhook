@@ -11,6 +11,7 @@ from pathlib import Path
 import requests
 from flask import Flask, request, jsonify, send_from_directory
 from openai import OpenAI
+from PIL import Image
 
 
 # =========================================================
@@ -24,7 +25,7 @@ logger = logging.getLogger("superbikers")
 
 
 # =========================================================
-# VARIABLES DE ENTORNO
+# VARIABLES
 # =========================================================
 
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
@@ -51,7 +52,7 @@ openai_client = (
 
 
 # =========================================================
-# ESTADO TEMPORAL
+# ESTADO
 # =========================================================
 
 pending_motos = {}
@@ -61,7 +62,6 @@ state_lock = threading.Lock()
 
 
 def new_session():
-
     return {
         "photos": [],
         "text": "",
@@ -79,14 +79,12 @@ def new_session():
 # =========================================================
 
 def sender_key(sender):
-
     return hashlib.sha256(
         sender.encode("utf-8")
     ).hexdigest()[:18]
 
 
 def sender_folder(sender):
-
     return (
         Path("/tmp/superbikers")
         / sender_key(sender)
@@ -94,7 +92,6 @@ def sender_folder(sender):
 
 
 def normalize_text(text):
-
     if not text:
         return ""
 
@@ -107,7 +104,6 @@ def normalize_text(text):
 
 
 def safe_filename(text):
-
     text = re.sub(
         r"[^a-zA-Z0-9_-]+",
         "_",
@@ -118,7 +114,7 @@ def safe_filename(text):
 
 
 # =========================================================
-# NORMALIZAR NUMERO DESTINATARIO
+# NORMALIZAR NUMERO
 # =========================================================
 
 def normalize_whatsapp_recipient(number):
@@ -129,15 +125,11 @@ def normalize_whatsapp_recipient(number):
         number or ""
     )
 
-    # México:
-    # algunos webhooks pueden entregar 521XXXXXXXXXX
-    # Meta puede tener autorizado 52XXXXXXXXXX
     if (
         digits.startswith("521")
         and
         len(digits) == 13
     ):
-
         digits = (
             "52"
             +
@@ -189,12 +181,6 @@ def extract_price(text):
         if line.strip()
     ]
 
-
-    # =====================================================
-    # PRIORIDAD 1:
-    # SEGUNDA LINEA
-    # =====================================================
-
     if len(lines) >= 2:
 
         second = lines[1]
@@ -219,11 +205,6 @@ def extract_price(text):
                 return price
 
 
-    # =====================================================
-    # PRIORIDAD 2:
-    # SIGNO $
-    # =====================================================
-
     match = re.search(
         r'\$\s*'
         r'(\d{2,3}(?:[,\.\s]\d{3})+|\d{5,7})',
@@ -239,11 +220,6 @@ def extract_price(text):
         if price:
             return price
 
-
-    # =====================================================
-    # PRIORIDAD 3:
-    # PALABRA PRECIO
-    # =====================================================
 
     match = re.search(
         r'(?i)\bprecio\b'
@@ -335,9 +311,7 @@ def extract_cover_title(text):
         if extract_price(line):
             continue
 
-        return clean_cover_title(
-            line
-        )
+        return clean_cover_title(line)
 
     return ""
 
@@ -396,7 +370,7 @@ def get_extension_from_mime(mime_type):
 
 
 # =========================================================
-# WHATSAPP - ENVIAR TEXTO
+# WHATSAPP TEXTO
 # =========================================================
 
 def send_whatsapp_text(
@@ -420,11 +394,9 @@ def send_whatsapp_text(
         or
         not phone_number_id
     ):
-
         logger.error(
             "Falta token o PHONE_NUMBER_ID"
         )
-
         return False
 
 
@@ -434,15 +406,12 @@ def send_whatsapp_text(
         f"{phone_number_id}/messages"
     )
 
-
     headers = {
         "Authorization":
             f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-
         "Content-Type":
             "application/json"
     }
-
 
     payload = {
         "messaging_product": "whatsapp",
@@ -454,7 +423,6 @@ def send_whatsapp_text(
         }
     }
 
-
     try:
 
         response = requests.post(
@@ -464,12 +432,10 @@ def send_whatsapp_text(
             timeout=60
         )
 
-
         logger.info(
             "WHATSAPP TEXT STATUS: %s",
             response.status_code
         )
-
 
         if response.status_code >= 400:
 
@@ -480,9 +446,7 @@ def send_whatsapp_text(
 
             return False
 
-
         return True
-
 
     except Exception as error:
 
@@ -495,7 +459,7 @@ def send_whatsapp_text(
 
 
 # =========================================================
-# SUBIR PORTADA A WHATSAPP
+# SUBIR PORTADA WHATSAPP
 # =========================================================
 
 def upload_media_to_whatsapp(
@@ -509,19 +473,16 @@ def upload_media_to_whatsapp(
         PHONE_NUMBER_ID
     )
 
-
     url = (
         f"https://graph.facebook.com/"
         f"{GRAPH_API_VERSION}/"
         f"{phone_number_id}/media"
     )
 
-
     headers = {
         "Authorization":
             f"Bearer {WHATSAPP_ACCESS_TOKEN}"
     }
-
 
     try:
 
@@ -529,7 +490,6 @@ def upload_media_to_whatsapp(
             file_path,
             "rb"
         ) as image_file:
-
 
             files = {
                 "file": (
@@ -539,7 +499,6 @@ def upload_media_to_whatsapp(
                 )
             }
 
-
             data = {
                 "messaging_product":
                     "whatsapp",
@@ -547,7 +506,6 @@ def upload_media_to_whatsapp(
                 "type":
                     "image/png"
             }
-
 
             response = requests.post(
                 url,
@@ -557,12 +515,10 @@ def upload_media_to_whatsapp(
                 timeout=120
             )
 
-
         logger.info(
             "UPLOAD PORTADA STATUS: %s",
             response.status_code
         )
-
 
         if response.status_code >= 400:
 
@@ -573,11 +529,9 @@ def upload_media_to_whatsapp(
 
             return None
 
-
         return response.json().get(
             "id"
         )
-
 
     except Exception as error:
 
@@ -590,7 +544,7 @@ def upload_media_to_whatsapp(
 
 
 # =========================================================
-# ENVIAR PORTADA AL WHATSAPP
+# ENVIAR PORTADA WHATSAPP
 # =========================================================
 
 def send_cover_to_whatsapp(
@@ -605,22 +559,18 @@ def send_cover_to_whatsapp(
         recipient
     )
 
-
     phone_number_id = (
         phone_number_id
         or
         PHONE_NUMBER_ID
     )
 
-
     media_id = upload_media_to_whatsapp(
         phone_number_id,
         file_path
     )
 
-
     if not media_id:
-
         return False
 
 
@@ -630,15 +580,12 @@ def send_cover_to_whatsapp(
         f"{phone_number_id}/messages"
     )
 
-
     headers = {
         "Authorization":
             f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-
         "Content-Type":
             "application/json"
     }
-
 
     caption = (
         f"✅ PORTADA LISTA\n"
@@ -646,7 +593,6 @@ def send_cover_to_whatsapp(
         f"{price}\n"
         f"Superbikers Shop"
     )
-
 
     payload = {
         "messaging_product": "whatsapp",
@@ -659,7 +605,6 @@ def send_cover_to_whatsapp(
         }
     }
 
-
     try:
 
         response = requests.post(
@@ -669,12 +614,10 @@ def send_cover_to_whatsapp(
             timeout=60
         )
 
-
         logger.info(
             "ENVIO PORTADA STATUS: %s",
             response.status_code
         )
-
 
         if response.status_code >= 400:
 
@@ -685,14 +628,11 @@ def send_cover_to_whatsapp(
 
             return False
 
-
         logger.info(
             "PORTADA ENVIADA AL WHATSAPP ✅"
         )
 
-
         return True
-
 
     except Exception as error:
 
@@ -705,7 +645,7 @@ def send_cover_to_whatsapp(
 
 
 # =========================================================
-# DESCARGAR IMAGEN
+# DESCARGAR FOTO
 # =========================================================
 
 def try_download_url(
@@ -715,7 +655,6 @@ def try_download_url(
 
     if not media_url:
         return None
-
 
     for attempt in range(3):
 
@@ -727,18 +666,14 @@ def try_download_url(
                 timeout=60
             )
 
-
             if response.status_code == 200:
-
                 return response.content
-
 
             logger.warning(
                 "Descarga intento %s: HTTP %s",
                 attempt + 1,
                 response.status_code
             )
-
 
         except requests.RequestException as error:
 
@@ -748,11 +683,9 @@ def try_download_url(
                 error
             )
 
-
         time.sleep(
             0.8 * (attempt + 1)
         )
-
 
     return None
 
@@ -773,19 +706,12 @@ def download_whatsapp_image(
 
         return None
 
-
     headers = {
         "Authorization":
             f"Bearer {WHATSAPP_ACCESS_TOKEN}"
     }
 
-
     image_bytes = None
-
-
-    # =====================================================
-    # INTENTO URL DEL WEBHOOK
-    # =====================================================
 
     if direct_url:
 
@@ -793,11 +719,6 @@ def download_whatsapp_image(
             direct_url,
             headers
         )
-
-
-    # =====================================================
-    # INTENTO POR MEDIA ID
-    # =====================================================
 
     if not image_bytes:
 
@@ -807,7 +728,6 @@ def download_whatsapp_image(
             f"{media_id}"
         )
 
-
         try:
 
             info_response = requests.get(
@@ -816,20 +736,17 @@ def download_whatsapp_image(
                 timeout=30
             )
 
-
             if info_response.status_code == 200:
 
                 media_info = (
                     info_response.json()
                 )
 
-
                 fallback_url = (
                     media_info.get(
                         "url"
                     )
                 )
-
 
                 mime_type = (
                     media_info.get(
@@ -839,12 +756,10 @@ def download_whatsapp_image(
                     mime_type
                 )
 
-
                 image_bytes = try_download_url(
                     fallback_url,
                     headers
                 )
-
 
             else:
 
@@ -854,14 +769,12 @@ def download_whatsapp_image(
                     info_response.text[:500]
                 )
 
-
         except requests.RequestException as error:
 
             logger.exception(
                 "Error consultando media_id: %s",
                 error
             )
-
 
     if not image_bytes:
 
@@ -877,17 +790,14 @@ def download_whatsapp_image(
         mime_type
     )
 
-
     folder = sender_folder(
         sender
     )
-
 
     folder.mkdir(
         parents=True,
         exist_ok=True
     )
-
 
     filepath = (
         folder
@@ -895,17 +805,14 @@ def download_whatsapp_image(
         f"foto_{photo_number:02d}{extension}"
     )
 
-
     filepath.write_bytes(
         image_bytes
     )
-
 
     logger.info(
         "FOTO %s/10 DESCARGADA CORRECTAMENTE",
         photo_number
     )
-
 
     return str(
         filepath
@@ -913,7 +820,7 @@ def download_whatsapp_image(
 
 
 # =========================================================
-# PROMPT SUPERBIKERS
+# PROMPT
 # =========================================================
 
 def build_superbikers_prompt(
@@ -923,7 +830,6 @@ def build_superbikers_prompt(
 ):
 
     flag_instruction = ""
-
 
     if flags:
 
@@ -972,55 +878,17 @@ DEBE SEGUIR PARECIENDO
 UNA FOTOGRAFIA REAL.
 
 
-==================================================
-
-TITULO GRANDE ARRIBA
-
-ESCRIBIR EXACTAMENTE:
+TITULO GRANDE ARRIBA:
 
 "{title}"
 
 
-Debe ser:
-
-- grande
-- brush / graffiti automotriz
-- deportivo
-- agresivo
-- elegante
-- legible
-- premium
-
-
-El titulo debe ser
-el texto principal.
-
-
-==================================================
-
-MOTOCICLETA
-
-Debe ser la protagonista.
-
-Grande.
-
-Visible.
-
-Realista.
-
-No cubrirla innecesariamente.
-
-
-==================================================
-
-PRECIO
-
-ESCRIBIR EXACTAMENTE:
+PRECIO:
 
 "{price}"
 
 
-MUY IMPORTANTE:
+REGLA MUY IMPORTANTE:
 
 NO CAMBIAR EL PRECIO.
 
@@ -1029,36 +897,18 @@ NO ESCRIBIR:
 - PRECIO DISPONIBLE
 - CONSULTA PRECIO
 - PREGUNTA PRECIO
-- ninguna frase sustituta
 
 
 El precio debe ir:
 
 CENTRADO
+DEBAJO DE LA MOTOCICLETA
 
-DEBAJO DE LA MOTOCICLETA.
-
-
-En un recuadro:
-
-- pequeño
-- compacto
-- premium
-- deportivo
+En un recuadro pequeño,
+compacto y deportivo.
 
 
-El recuadro del precio
-debe ser mucho más pequeño
-que el titulo.
-
-
-==================================================
-
-SUPERBIKERS SHOP
-
-Escribir exactamente:
-
-"Superbikers Shop"
+SUPERBIKERS SHOP:
 
 Hasta abajo.
 
@@ -1072,44 +922,18 @@ Tipografía:
 - automotriz
 
 
-==================================================
-
 {flag_instruction}
 
 
-DETALLES GRAFICOS:
-
-Usar colores inspirados
-en la motocicleta.
-
-Se permiten:
-
-- pincelazos
-- líneas deportivas
-- detalles en esquinas
-
-NO sobrecargar.
-
-
-==================================================
-
-ORDEN VISUAL OBLIGATORIO:
+ORDEN:
 
 TITULO GRANDE ARRIBA
 
-↓
-
 MOTOCICLETA
 
-↓
+PRECIO PEQUEÑO ABAJO DE LA MOTO
 
-PRECIO PEQUEÑO
-DEBAJO DE LA MOTO
-
-↓
-
-SUPERBIKERS SHOP
-HASTA ABAJO
+SUPERBIKERS SHOP HASTA ABAJO
 
 
 NO AGREGAR:
@@ -1121,19 +945,13 @@ NO AGREGAR:
 - millas
 - factura
 - pedimento
-- condiciones de venta
+- condiciones
 - marcas de agua nuevas
-
-
-Resultado:
-
-Post publicitario premium
-para Superbikers Shop.
 """.strip()
 
 
 # =========================================================
-# OPENAI
+# OPENAI + PNG + JPG INSTAGRAM
 # =========================================================
 
 def create_cover_with_openai(
@@ -1179,12 +997,10 @@ def create_cover_with_openai(
         "=============== OPENAI PORTADA ==============="
     )
 
-
     logger.info(
         "Titulo: %s",
         title
     )
-
 
     logger.info(
         "Precio EXACTO: %s",
@@ -1199,12 +1015,10 @@ def create_cover_with_openai(
             "rb"
         ) as image_file:
 
-
             result = (
                 openai_client
                 .images
                 .edit(
-
                     model=
                         "gpt-image-2.5-sunburst",
 
@@ -1221,7 +1035,6 @@ def create_cover_with_openai(
                         "high"
                 )
             )
-
 
     except Exception as error:
 
@@ -1252,7 +1065,6 @@ def create_cover_with_openai(
             result.data[0].b64_json
         )
 
-
     except Exception as error:
 
         logger.exception(
@@ -1271,14 +1083,17 @@ def create_cover_with_openai(
         "generated"
     )
 
-
     output_folder.mkdir(
         parents=True,
         exist_ok=True
     )
 
 
-    filename = (
+    # =====================================================
+    # PNG
+    # =====================================================
+
+    png_filename = (
         safe_filename(
             title
         )
@@ -1286,17 +1101,65 @@ def create_cover_with_openai(
         "_openai.png"
     )
 
-
-    output_path = (
+    png_path = (
         output_folder
         /
-        filename
+        png_filename
     )
 
-
-    output_path.write_bytes(
+    png_path.write_bytes(
         image_bytes
     )
+
+
+    # =====================================================
+    # JPG REAL PARA INSTAGRAM
+    # =====================================================
+
+    instagram_filename = (
+        safe_filename(
+            title
+        )
+        +
+        "_instagram.jpg"
+    )
+
+    instagram_path = (
+        output_folder
+        /
+        instagram_filename
+    )
+
+
+    try:
+
+        with Image.open(
+            png_path
+        ) as img:
+
+            img = img.convert(
+                "RGB"
+            )
+
+            img.save(
+                instagram_path,
+                "JPEG",
+                quality=95,
+                optimize=True
+            )
+
+        logger.info(
+            "JPG INSTAGRAM CREADO ✅"
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "ERROR CREANDO JPG INSTAGRAM: %s",
+            error
+        )
+
+        return None
 
 
     public_id = sender_key(
@@ -1304,11 +1167,19 @@ def create_cover_with_openai(
     )
 
 
-    url = (
+    png_url = (
         f"{BASE_URL}"
         f"/generated/"
         f"{public_id}/"
-        f"{filename}"
+        f"{png_filename}"
+    )
+
+
+    instagram_url = (
+        f"{BASE_URL}"
+        f"/generated/"
+        f"{public_id}/"
+        f"{instagram_filename}"
     )
 
 
@@ -1316,27 +1187,40 @@ def create_cover_with_openai(
         "PORTADA OPENAI CREADA"
     )
 
-
     logger.info(
         "PORTADA OPENAI URL: %s",
-        url
+        png_url
+    )
+
+    logger.info(
+        "INSTAGRAM JPG URL: %s",
+        instagram_url
     )
 
 
     return {
         "file_path":
-            str(output_path),
+            str(png_path),
 
         "url":
-            url,
+            png_url,
 
         "filename":
-            filename
+            png_filename,
+
+        "instagram_file_path":
+            str(instagram_path),
+
+        "instagram_url":
+            instagram_url,
+
+        "instagram_filename":
+            instagram_filename
     }
 
 
 # =========================================================
-# PROCESAR MOTO
+# PROCESAR
 # =========================================================
 
 def maybe_start_processing(
@@ -1349,18 +1233,13 @@ def maybe_start_processing(
             sender
         )
 
-
         if not session:
-
             return False
-
 
         if session.get(
             "processing"
         ):
-
             return False
-
 
         if (
             len(
@@ -1368,14 +1247,11 @@ def maybe_start_processing(
             )
             != 10
         ):
-
             return False
-
 
         if not session[
             "text"
         ]:
-
             return False
 
 
@@ -1404,10 +1280,6 @@ def maybe_start_processing(
         )
 
 
-        # =================================================
-        # NO HAY PRECIO
-        # =================================================
-
         if not price:
 
             session[
@@ -1422,7 +1294,6 @@ def maybe_start_processing(
                 session[
                     "price_notice_sent"
                 ] = True
-
 
                 threading.Thread(
                     target=
@@ -1444,7 +1315,6 @@ def maybe_start_processing(
             logger.error(
                 "PRECIO NO DETECTADO"
             )
-
 
             return False
 
@@ -1488,14 +1358,11 @@ def maybe_start_processing(
         daemon=True
     )
 
-
     thread.start()
-
 
     logger.info(
         "GENERACION INICIADA EN SEGUNDO PLANO"
     )
-
 
     return True
 
@@ -1540,7 +1407,6 @@ def process_moto_background(
                 )
             )
 
-
             existing_cover = (
                 current_session.get(
                     "generated_cover"
@@ -1549,10 +1415,6 @@ def process_moto_background(
                 else None
             )
 
-
-        # =================================================
-        # REUTILIZAR SI YA EXISTE
-        # =================================================
 
         if (
             existing_cover
@@ -1572,7 +1434,6 @@ def process_moto_background(
                 "REUTILIZANDO PORTADA YA GENERADA"
             )
 
-
         else:
 
             generated_cover = (
@@ -1585,10 +1446,6 @@ def process_moto_background(
                 )
             )
 
-
-        # =================================================
-        # ERROR OPENAI
-        # =================================================
 
         if not generated_cover:
 
@@ -1615,13 +1472,8 @@ def process_moto_background(
                 "Envía REINTENTAR."
             )
 
-
             return
 
-
-        # =================================================
-        # GUARDAR PORTADA
-        # =================================================
 
         with state_lock:
 
@@ -1631,17 +1483,12 @@ def process_moto_background(
                 )
             )
 
-
             if session:
 
                 session[
                     "generated_cover"
                 ] = generated_cover
 
-
-        # =================================================
-        # DEVOLVER POR WHATSAPP
-        # =================================================
 
         sent = send_cover_to_whatsapp(
             recipient=
@@ -1663,16 +1510,18 @@ def process_moto_background(
         )
 
 
-        # =================================================
-        # EXITO TOTAL
-        # =================================================
-
         if sent:
 
             logger.info(
                 "PORTADA GENERADA Y DEVUELTA A WHATSAPP ✅"
             )
 
+            logger.info(
+                "URL INSTAGRAM LISTA: %s",
+                generated_cover[
+                    "instagram_url"
+                ]
+            )
 
             with state_lock:
 
@@ -1681,16 +1530,11 @@ def process_moto_background(
                 ] = new_session()
 
 
-        # =================================================
-        # ERROR SOLO ENVIO
-        # =================================================
-
         else:
 
             logger.error(
                 "PORTADA GENERADA PERO NO SE PUDO ENVIAR"
             )
-
 
             with state_lock:
 
@@ -1699,7 +1543,6 @@ def process_moto_background(
                         sender
                     )
                 )
-
 
                 if session:
 
@@ -1724,7 +1567,6 @@ def process_moto_background(
             error
         )
 
-
         with state_lock:
 
             session = (
@@ -1732,7 +1574,6 @@ def process_moto_background(
                     sender
                 )
             )
-
 
             if session:
 
@@ -1765,13 +1606,11 @@ def privacy():
     <html>
     <body style="font-family:Arial;max-width:800px;margin:40px auto;">
         <h1>Política de Privacidad - Superbikers Shop</h1>
-
         <p>
             La información recibida se utiliza
             para atender solicitudes y generar
             contenido relacionado con motocicletas.
         </p>
-
         <p>
             No vendemos información personal.
         </p>
@@ -1781,7 +1620,7 @@ def privacy():
 
 
 # =========================================================
-# PORTADA PUBLICA
+# ARCHIVOS GENERADOS
 # =========================================================
 
 @app.get(
@@ -1799,7 +1638,6 @@ def generated(
         /
         "generated"
     )
-
 
     return send_from_directory(
         folder,
@@ -1826,7 +1664,6 @@ def verify_webhook():
         "hub.challenge"
     )
 
-
     if (
         mode == "subscribe"
         and
@@ -1836,7 +1673,6 @@ def verify_webhook():
     ):
 
         return challenge, 200
-
 
     return "Forbidden", 403
 
@@ -1855,7 +1691,6 @@ def webhook():
         or {}
     )
 
-
     logger.info(
         "WEBHOOK RECIBIDO"
     )
@@ -1866,24 +1701,20 @@ def webhook():
         []
     ):
 
-
         for change in entry.get(
             "changes",
             []
         ):
-
 
             value = change.get(
                 "value",
                 {}
             )
 
-
             metadata = value.get(
                 "metadata",
                 {}
             )
-
 
             incoming_phone_number_id = (
                 metadata.get(
@@ -1899,11 +1730,9 @@ def webhook():
                 []
             ):
 
-
                 sender = message.get(
                     "from"
                 )
-
 
                 if not sender:
                     continue
@@ -1914,10 +1743,6 @@ def webhook():
                 )
 
 
-                # =================================================
-                # DUPLICADOS
-                # =================================================
-
                 if message_id:
 
                     with state_lock:
@@ -1926,7 +1751,6 @@ def webhook():
                             message_id
                             in seen_message_ids
                         ):
-
                             continue
 
 
@@ -1959,7 +1783,6 @@ def webhook():
                         )
                     )
 
-
                     session[
                         "phone_number_id"
                     ] = incoming_phone_number_id
@@ -1982,28 +1805,23 @@ def webhook():
                     "image"
                 ):
 
-
                     image = message.get(
                         "image",
                         {}
                     )
 
-
                     media_id = image.get(
                         "id"
                     )
-
 
                     direct_url = image.get(
                         "url"
                     )
 
-
                     mime_type = image.get(
                         "mime_type",
                         "image/jpeg"
                     )
-
 
                     caption = normalize_text(
                         image.get(
@@ -2021,13 +1839,10 @@ def webhook():
                             ]
                         )
 
-
                         if session.get(
                             "processing"
                         ):
-
                             continue
-
 
                         current_count = len(
                             session[
@@ -2075,10 +1890,6 @@ def webhook():
                     )
 
 
-                    # =================================================
-                    # FOTO FALLO
-                    # =================================================
-
                     if not file_path:
 
                         send_whatsapp_text(
@@ -2092,10 +1903,6 @@ def webhook():
                         continue
 
 
-                    # =================================================
-                    # REGISTRAR FOTO
-                    # =================================================
-
                     with state_lock:
 
                         session = (
@@ -2103,7 +1910,6 @@ def webhook():
                                 sender
                             ]
                         )
-
 
                         session[
                             "photos"
@@ -2164,7 +1970,6 @@ def webhook():
                     "text"
                 ):
 
-
                     text = normalize_text(
 
                         message.get(
@@ -2174,7 +1979,6 @@ def webhook():
                             "body",
                             ""
                         )
-
                     )
 
 
@@ -2185,10 +1989,6 @@ def webhook():
                     )
 
 
-                    # =================================================
-                    # RESET
-                    # =================================================
-
                     if command == "RESET":
 
                         with state_lock:
@@ -2196,7 +1996,6 @@ def webhook():
                             pending_motos[
                                 sender
                             ] = new_session()
-
 
                             pending_motos[
                                 sender
@@ -2215,10 +2014,6 @@ def webhook():
                         continue
 
 
-                    # =================================================
-                    # REINTENTAR
-                    # =================================================
-
                     if command == "REINTENTAR":
 
                         with state_lock:
@@ -2228,7 +2023,6 @@ def webhook():
                                     sender
                                 )
                             )
-
 
                             if session:
 
@@ -2260,10 +2054,6 @@ def webhook():
                         )
 
 
-                        # =================================================
-                        # ESPERANDO SOLO PRECIO
-                        # =================================================
-
                         if (
                             session.get(
                                 "waiting_for_price"
@@ -2276,11 +2066,9 @@ def webhook():
                                 "price_override"
                             ] = detected_price
 
-
                             session[
                                 "waiting_for_price"
                             ] = False
-
 
                             session[
                                 "price_notice_sent"
@@ -2292,10 +2080,6 @@ def webhook():
                                 detected_price
                             )
 
-
-                        # =================================================
-                        # MENSAJE SOLO PRECIO
-                        # =================================================
 
                         elif (
                             is_price_only_message(
@@ -2311,10 +2095,6 @@ def webhook():
                                 "price_override"
                             ] = detected_price
 
-
-                        # =================================================
-                        # TEXTO COMPLETO
-                        # =================================================
 
                         else:
 
@@ -2334,10 +2114,6 @@ def webhook():
                         "TEXTO RECIBIDO"
                     )
 
-
-                # =================================================
-                # INTENTAR GENERAR
-                # =================================================
 
                 maybe_start_processing(
                     sender
@@ -2361,7 +2137,6 @@ if __name__ == "__main__":
             "10000"
         )
     )
-
 
     app.run(
         host="0.0.0.0",
